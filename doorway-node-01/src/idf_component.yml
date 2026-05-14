@@ -1,0 +1,4 @@
+dependencies:
+  rjrp44/vl53l5cx: "^4.0.1"
+  idf:
+    version: ">=5.4"

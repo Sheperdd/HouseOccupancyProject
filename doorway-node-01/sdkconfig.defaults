@@ -1,0 +1,3 @@
+# VL53L5CX firmware upload (~84KB over I2C) needs a larger app_main stack.
+# Default 3584 overflows during vl53l5cx_init.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=7168
