@@ -8,6 +8,8 @@
 
 static const char *TAG = "vl53l5cx";
 
+// The VL53L5CX supports up to 8x8 resolution, but you can also configure it for 4x4 or 2x2. For this example, we'll use the full 8x8 grid.
+
 #define SENSOR_SDA_GPIO   GPIO_NUM_21
 #define SENSOR_SCL_GPIO   GPIO_NUM_22
 #define SENSOR_I2C_FREQ   400000
