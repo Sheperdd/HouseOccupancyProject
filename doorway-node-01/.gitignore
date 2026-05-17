@@ -6,6 +6,7 @@
 # ESP-IDF build artifacts
 build/
 sdkconfig.old
+sdkconfig.esp32dev
 managed_components/
 dependencies.lock
 
