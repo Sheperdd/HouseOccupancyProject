@@ -18,8 +18,11 @@
 #include "freertos/task.h"     // vTaskDelay() — sleep without blocking other tasks
 #include "esp_log.h"           // ESP_LOGI/E — nicely formatted log output over serial
 #include "esp_err.h"           // ESP_ERROR_CHECK — aborts the program on a hardware error
+#include "esp_timer.h"         // esp_timer_get_time() — microsecond-resolution uptime for timestamps
+#include "esp_system.h"        // esp_chip_info() — get info about the ESP32 chip we're running on
 #include "driver/i2c_master.h" // The new ESP-IDF v5 I2C driver (master-mode API)
 #include "vl53l5cx_api.h"      // ST's official driver for the sensor
+#include "driver/uart.h"       // For UART configuration
 
 // "Tag" used by the logging system. Every ESP_LOGI/ESP_LOGE line gets
 // prefixed with this so you can filter logs by subsystem in the serial monitor.
@@ -59,6 +62,10 @@ void app_main(void)
     // Small scratch variables for return codes and ready/alive flags.
     // The ST driver returns 0 on success and non-zero on failure.
     uint8_t status, isAlive, isReady;
+
+    fflush(stdout);                                   // Make sure all our printf output goes out immediately, not buffered
+    uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(10)); // Wait for any pending UART output to finish before we start logging
+    uart_set_baudrate(UART_NUM_0, 921600);            // Speed up the serial output to 921600 baud (115200 is the default, but it can't keep up with 10+ FPS of depth frames at 8x8 resolution)
 
     // ------------------------------------------------------------------------
     // Step 1: Set up the I2C bus
@@ -158,44 +165,125 @@ void app_main(void)
     ESP_LOGI(TAG, "Ranging started. Streaming 8x8 depth grids...");
 
     // ------------------------------------------------------------------------
-    // Step 6: Main loop — pull frames and print them
+    // Step 6: Main loop — read frames, emit structured logs, track timing
     // ------------------------------------------------------------------------
+    // Two output streams interleave on the serial port:
+    //   FRAME,<seq>,<t_us>,<64 distances>,<64 statuses>
+    //   STATS,<t_us>,<free_heap>,<min_heap>,<stack_hwm>,<avg_period_us>,
+    //         <max_period_us>,<avg_read_us>
+    // FRAME lines stream every ranging cycle; STATS lines are emitted once
+    // per second and reset their measurement window.
+    //
+    // Why both? FRAME is the data we're capturing for offline analysis.
+    // STATS lets us prove (or disprove) that the ESP32 has headroom for
+    // Phase 2's detection logic and Phase 3's WiFi + MQTT load.
+
     int frame_count = 0;
+
+    // Timing accumulators — all in microseconds, all reset each STATS window.
+    int64_t last_frame_us = 0;       // Timestamp of the most recent completed frame
+    int64_t last_stats_us = 0;       // When we last emitted a STATS line
+    int64_t sum_frame_period_us = 0; // Sum of inter-frame intervals this window
+    int64_t max_frame_period_us = 0; // Worst inter-frame interval this window
+    int64_t sum_sensor_read_us = 0;  // Sum of sensor-read durations this window
+    int periods_in_window = 0;       // Number of inter-frame intervals measured
+    int reads_in_window = 0;         // Number of sensor reads (>= periods + 1)
+
     while (1)
     {
-        // Ask the sensor: "do you have a new frame waiting for me?"
-        // This is a cheap I2C read of a single status register.
         status = vl53l5cx_check_data_ready(&Dev, &isReady);
 
         if (isReady)
         {
-            // Yes — pull the full frame (all 64 distances plus metadata)
-            // into our Results struct over I2C.
+            // Bracket the I2C read with esp_timer to measure how long the
+            // sensor takes to hand us a frame. At 8x8 / 10 Hz this is on
+            // the order of 10-30ms — a meaningful chunk of our 100ms budget,
+            // worth watching as we add more work to the loop in later phases.
+            int64_t before_read = esp_timer_get_time();
             vl53l5cx_get_ranging_data(&Dev, &Results);
+            int64_t after_read = esp_timer_get_time();
             frame_count++;
 
-            // Print the frame as an 8x8 grid of millimeter distances.
-            // The sensor returns the 64 zones in a flat array, row-major,
-            // so index [row*8 + col] gives the cell at (row, col).
-            printf("\n--- Frame %d ---\n", frame_count);
-            for (int row = 0; row < 8; row++)
+            // Update timing stats for this window.
+            sum_sensor_read_us += (after_read - before_read);
+            reads_in_window++;
+
+            // Skip the period calculation on the very first frame after boot
+            // (last_frame_us is still 0), so we don't record a bogus huge gap.
+            if (last_frame_us != 0)
             {
-                for (int col = 0; col < 8; col++)
+                int64_t period = after_read - last_frame_us;
+                sum_frame_period_us += period;
+                if (period > max_frame_period_us)
                 {
-                    int idx = row * 8 + col;
-                    printf("%5d ", Results.distance_mm[idx]);
+                    max_frame_period_us = period;
                 }
-                printf("\n");
+                periods_in_window++;
+            }
+            last_frame_us = after_read;
+
+            // ----- Emit FRAME line -----------------------------------------
+            // Single line, comma-separated. printf is line-buffered by ESP-IDF's
+            // stdio, so the '\n' at the end triggers a flush — the Python
+            // capture script will see one whole line at a time, never partial.
+            printf("FRAME,%d,%lld", frame_count, after_read);
+            for (int i = 0; i < 64; i++)
+            {
+                printf(",%d", Results.distance_mm[i]);
+            }
+            for (int i = 0; i < 64; i++)
+            {
+                printf(",%d", Results.target_status[i]);
+            }
+            printf("\n");
+
+            // ----- Emit STATS line once per second -------------------------
+            if (after_read - last_stats_us >= 1000000)
+            {
+                // Averages over the just-completed window. Guard against
+                // divide-by-zero on the very first window (one frame, zero
+                // periods).
+                int64_t avg_period = periods_in_window > 0
+                                         ? sum_frame_period_us / periods_in_window
+                                         : 0;
+                int64_t avg_read = reads_in_window > 0
+                                       ? sum_sensor_read_us / reads_in_window
+                                       : 0;
+
+                // esp_get_free_heap_size() = bytes available right now.
+                // esp_get_minimum_free_heap_size() = lifetime watermark — the
+                // lowest value free_heap has ever hit since boot. If this
+                // drops over time, you have a memory leak somewhere.
+                size_t free_heap = esp_get_free_heap_size();
+                size_t min_free_heap = esp_get_minimum_free_heap_size();
+
+                // uxTaskGetStackHighWaterMark(NULL) returns the closest this
+                // task's stack has come to overflowing, in *words* (4 bytes
+                // on ESP32). Multiply by 4 for bytes. NULL means "this task".
+                UBaseType_t stack_hwm_words = uxTaskGetStackHighWaterMark(NULL);
+                unsigned stack_hwm_bytes = (unsigned)stack_hwm_words * 4U;
+
+                printf("STATS,%lld,%u,%u,%u,%lld,%lld,%lld\n",
+                       after_read,
+                       (unsigned)free_heap,
+                       (unsigned)min_free_heap,
+                       stack_hwm_bytes,
+                       avg_period,
+                       max_frame_period_us,
+                       avg_read);
+
+                // Reset the window. Note we deliberately leave last_frame_us
+                // alone — the period from the last frame of this window to
+                // the first frame of the next is a real measurement.
+                sum_frame_period_us = 0;
+                max_frame_period_us = 0;
+                sum_sensor_read_us = 0;
+                periods_in_window = 0;
+                reads_in_window = 0;
+                last_stats_us = after_read;
             }
         }
 
-        // Sleep for 5 ms before polling again. vTaskDelay yields to FreeRTOS
-        // so other tasks (Wi-Fi, logging, the idle task that resets the
-        // watchdog) get to run — much better than a tight busy-loop, which
-        // would hog the CPU and eventually trigger a watchdog reset.
-        // At 10 Hz ranging a new frame arrives every 100 ms, so polling
-        // every 5 ms means we pick it up almost immediately without burning
-        // cycles.
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

@@ -5,7 +5,6 @@
 
 # ESP-IDF build artifacts
 build/
-sdkconfig.old
 sdkconfig.esp32dev
 managed_components/
 dependencies.lock
@@ -29,3 +28,6 @@ desktop.ini
 # Editor swap files
 *.swp
 *~
+
+# data files
+*.csv
