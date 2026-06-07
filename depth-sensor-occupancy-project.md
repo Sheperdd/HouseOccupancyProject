@@ -37,19 +37,19 @@ time**.
   developer is working on.
 - The developer is strong at programming but new to hardware. Provide step-by-step wiring
   instructions and explain electronics concepts as you go.
-- **Recognize when Claude Code would do this better, and offer to hand off — but ask first.**
-  Claude Code is the right tool when a task is primarily implementation work: multi-file edits,
-  iterating against real compiler or runtime output, installing and configuring libraries or
-  dependencies, scaffolding boilerplate, or any task where being able to read and modify the
-  actual project files (rather than asking the developer to paste them) materially speeds things
-  up. When the developer asks for something that fits cleanly, pause and ask explicitly: _"This
-  looks like a good Claude Code task — want me to write you a focused handoff prompt instead of
-  doing it inline here?"_ Wait for confirmation before producing the handoff message. **Stay
-  inline (don't suggest a handoff) for:** conceptual explanations, architecture and design
-  discussion, code snippets that are part of a learning conversation (the code itself is the
-  lesson), hardware and wiring guidance, step-by-step procedural work the developer follows by
-  hand, and anything where the developer is clearly thinking out loud or making a decision.
-  When in doubt, lean toward staying inline — gratuitous handoffs break the learning flow.
+- **Recognize when Claude Code would do this better, and offer to hand off — but ask first.** Claude
+  Code is the right tool when a task is primarily implementation work: multi-file edits, iterating
+  against real compiler or runtime output, installing and configuring libraries or dependencies,
+  scaffolding boilerplate, or any task where being able to read and modify the actual project files
+  (rather than asking the developer to paste them) materially speeds things up. When the developer
+  asks for something that fits cleanly, pause and ask explicitly: _"This looks like a good Claude
+  Code task — want me to write you a focused handoff prompt instead of doing it inline here?"_ Wait
+  for confirmation before producing the handoff message. **Stay inline (don't suggest a handoff)
+  for:** conceptual explanations, architecture and design discussion, code snippets that are part of
+  a learning conversation (the code itself is the lesson), hardware and wiring guidance,
+  step-by-step procedural work the developer follows by hand, and anything where the developer is
+  clearly thinking out loud or making a decision. When in doubt, lean toward staying inline —
+  gratuitous handoffs break the learning flow.
 
 ---
 
@@ -58,13 +58,60 @@ time**.
 _Update this section after completing each phase. These entries are authoritative — they override
 any contradicting details in the phase descriptions below._
 
-| Phase       | Decision                         | Details                                                                                                                                                                                                                                                                                                                                                     | Date       |
-| ----------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| Pre-Phase 1 | Framework: ESP-IDF (not Arduino) | Embedded systems is a stated learning goal. Will use PlatformIO with framework = espidf on the Freenove ESP32-WROOM boards. Project doc references to "Arduino sketch" should be mentally translated to ESP-IDF equivalents (app*main(), FreeRTOS tasks, native esp*\* APIs).                                                                               | 2026-05-05 |
-| Pre-Phase 1 | Sensor: VL53L5CX confirmed       | 8×8 ToF imager. 63° FOV well-matched to doorway geometry at ~2m mounting height. ESP-IDF driver landscape solid via rjrp44/vl53l5cx on Espressif Component Registry (built on ST's official ULD). VL53L8CX is fallback if Phase 1 testing shows 8×8 resolution insufficient.                                                                                | 2026-05-05 |
-| Pre-Phase 1 | Sensor vendor: ST VL53L5CX-SATEL | ST's own eval board, ordered from DigiKey Canada (~$25 CAD). Chosen over SparkFun ($32.50) and Pololu ($19.95) for: (a) it's the reference board the rjrp44 ESP-IDF library targets, (b) cheapest legit name-brand option, (c) closer to professional embedded workflow which aligns with ESP-IDF choice. Ordering one for Phase 1; second unit at Phase 4. | 2026-05-05 |
-| Phase 1     | Sensor wiring verified           | SATEL on breadboard with ESP32. Connections: GND→GND, 3V3→IOVDD, 3V3→PWREN, GPIO 21→SDA, GPIO 22→SCL. AVDD reads 3.3V from internal regulator once PWREN is high — no external AVDD wire needed. I²C scanner detects sensor at 0x29 at 100kHz.                                                                                                              | 2026-05-13 |
-| Phase 1 | VL53L5CX basic ranging working on ESP32 | First sensor node (`doorway-node-01`) streaming live 8×8 depth grids at 10 Hz over USB serial. Stack: PlatformIO + ESP-IDF v5.x, `rjrp44/vl53l5cx` v4.0.1 via ESP-IDF component manager (NOT PlatformIO `lib_deps` — that doesn't work with the Espressif Component Registry). Key gotchas hit and resolved: (a) library v4.x dropped the legacy `driver/i2c.h` driver in favor of `driver/i2c_master.h` — SDA/SCL/freq are configured at **runtime** in `i2c_master_bus_config_t`, not via menuconfig (older docs/guides claiming Kconfig pin options are wrong for v4.x); (b) `Dev.platform.handle` must be populated via `i2c_new_master_bus()` + `i2c_master_bus_add_device()` before any API call — setting `Dev.platform.address` alone causes a `LoadProhibited` crash inside `i2c_master_multi_buffer_transmit` (uninit stack pattern `0xa5a5a5a5`); (c) device address passed to `i2c_master_bus_add_device` must be `VL53L5CX_DEFAULT_I2C_ADDRESS >> 1` (7-bit form, 0x29); (d) firmware upload during `vl53l5cx_init` (~84 KB over I2C, 2–3 s) overflows the default 3584-byte app_main stack — bumped `CONFIG_ESP_MAIN_TASK_STACK_SIZE` to 7168 via `sdkconfig.defaults` (committed; survives clean builds, unlike the generated `sdkconfig.esp32dev`). I2C running at 400 kHz on GPIO 21 (SDA) / GPIO 22 (SCL); 8×8 resolution at 10 Hz ranging frequency. | 2026-05-13 |
+- **Pre-Phase 1** Framework: ESP-IDF (not Arduino)
+
+  Embedded systems is a stated learning goal. Will use PlatformIO with framework = espidf on the Freenove ESP32-WROOM boards. Project doc references to "Arduino sketch" should be mentally translated to ESP-IDF equivalents (app*main(), FreeRTOS tasks, native esp*\* APIs). 2026-05-05
+
+- **Pre-Phase 1** Sensor: VL53L5CX confirmed
+
+  8×8 ToF imager. 63° FOV well-matched to doorway geometry at ~2m mounting height. ESP-IDF driver landscape solid via rjrp44/vl53l5cx on Espressif Component Registry (built on ST's official ULD). VL53L8CX is fallback if Phase 1 testing shows 8×8 resolution insufficient. 2026-05-05
+
+- **Pre-Phase 1** Sensor vendor: ST VL53L5CX-SATEL
+
+  ST's own eval board, ordered from DigiKey Canada (~$25 CAD). Chosen over SparkFun ($32.50) and Pololu ($19.95) for: (a) it's the reference board the rjrp44 ESP-IDF library targets, (b) cheapest legit name-brand option, (c) closer to professional embedded workflow which aligns with ESP-IDF choice. Ordering one for Phase 1; second unit at Phase 4. 2026-05-05
+
+- **Phase 1** Sensor wiring verified
+
+  SATEL on breadboard with ESP32. Connections: GND→GND, 3V3→IOVDD, 3V3→PWREN, GPIO 21→SDA, GPIO 22→SCL. AVDD reads 3.3V from internal regulator once PWREN is high — no external AVDD wire needed. I²C scanner detects sensor at 0x29 at 100kHz. 2026-05-13
+
+- **Phase 1** VL53L5CX basic ranging working on ESP32
+
+  First sensor node (`doorway-node-01`) streaming live 8×8 depth grids at 10 Hz over USB serial. Stack: PlatformIO + ESP-IDF v5.x, `rjrp44/vl53l5cx` v4.0.1 via ESP-IDF component manager (NOT PlatformIO `lib_deps` — that doesn't work with the Espressif Component Registry). Key gotchas hit and resolved: (a) library v4.x dropped the legacy `driver/i2c.h` driver in favor of `driver/i2c_master.h` — SDA/SCL/freq are configured at **runtime** in `i2c_master_bus_config_t`, not via menuconfig (older docs/guides claiming Kconfig pin options are wrong for v4.x); (b) `Dev.platform.handle` must be populated via `i2c_new_master_bus()` + `i2c_master_bus_add_device()` before any API call — setting `Dev.platform.address` alone causes a `LoadProhibited` crash inside `i2c_master_multi_buffer_transmit` (uninit stack pattern `0xa5a5a5a5`); (c) device address passed to `i2c_master_bus_add_device` must be `VL53L5CX_DEFAULT_I2C_ADDRESS >> 1` (7-bit form, 0x29); (d) firmware upload during `vl53l5cx_init` (~84 KB over I2C, 2–3 s) overflows the default 3584-byte app_main stack — bumped `CONFIG_ESP_MAIN_TASK_STACK_SIZE` to 7168 via `sdkconfig.defaults` (committed; survives clean builds, unlike the generated `sdkconfig.esp32dev`). I2C running at 400 kHz on GPIO 21 (SDA) / GPIO 22 (SCL); 8×8 resolution at 10 Hz ranging frequency. 2026-05-13
+
+- **Phase 1** Sensor adequacy and compute platform confirmed — proceed with VL53L5CX + ESP32
+
+  VL53L5CX 8×8 confirmed SUFFICIENT for doorway detection across 4 capture sessions (baseline, normal
+  walks, fast walks, stop-in-doorway; ~2,300 frames, 0 dropped):
+
+  - Person signal is unambiguous: 900+mm deviation from background, 20–32 occupied cells at peak. No
+    risk of person-vs-noise confusion.
+  - Direction recoverable: fast walks gave 8/8 clean direction alternation; normal walks 6/8 (2
+    failures were analysis artifacts — global centroid + uncorrected corner cells — not sensor
+    limits).
+  - ~15–20 frames/crossing (normal), ~8–12 (fast) at 10 Hz. Ample.
+  - Stop-in-doorway clearly separable: 4–7s sustained occupancy plateau vs 1.5–3s walk.
+  - Travel is DIAGONAL across the grid (sensor rotated vs walking path) — Phase 2 must use
+    2D/principal-axis centroid, not single-axis.
+  - Two-people-simultaneous NOT tested; deferred to real-world observation.
+
+  ESP32 confirmed SUFFICIENT with large margin:
+
+  - 9.96 Hz steady, 0 dropped frames across all sessions.
+  - Free heap 298,612 B (~292 KB), perfectly flat — no leaks.
+  - Stack HWM 7,392 B free. Sensor read ~35ms = 35% of 100ms frame budget; ~65ms/frame available for
+    Phase 2/3 work. Could sustain 15 Hz if needed.
+
+  Phase 2 algorithm requirements identified from the data:
+
+  1. Continuous/per-session background recalibration (mount drift observed: cell (0,1) drifted 935mm
+     between baseline and walks — stale baseline is unsafe).
+  2. Hot-pixel masking (cell (0,5) fires constantly).
+  3. Connected-component blob tracking (track largest blob; ignore persistent small artifacts) — not
+     global centroid.
+  4. 2D / principal-axis direction detection.
+
+  Captured sessions archived as Phase 2 test fixtures: empty_baseline, walks_alternating_out_first,
+  fast_walks_alternating_out_first, stop_in_doorway_out_first (+ matching stats files). 2026-06-07
 
 ---
 
