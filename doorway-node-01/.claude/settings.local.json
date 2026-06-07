@@ -3,7 +3,10 @@
     "allow": [
       "mcp__context7__resolve-library-id",
       "Bash(gh api *)",
-      "Bash(python -c \"import sys,base64; print\\(base64.b64decode\\(sys.stdin.read\\(\\)\\).decode\\(\\)\\)\")"
+      "Bash(python -c \"import sys,base64; print\\(base64.b64decode\\(sys.stdin.read\\(\\)\\).decode\\(\\)\\)\")",
+      "Read(//c/Users/shane/.claude/skills/**)",
+      "Read(//c/Users/shane/.claude/plugins/**)",
+      "Read(//c/Users/shane/.claude/**)"
     ]
   }
 }

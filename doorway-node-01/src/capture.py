@@ -79,8 +79,8 @@ def parse_args():
 def main():
     args = parse_args()
  
-    frames_path = Path(f"{args.basename}.frames.csv")
-    stats_path = Path(f"{args.basename}.stats.csv")
+    frames_path = Path(f"data/{args.basename}.frames.csv")
+    stats_path = Path(f"data/{args.basename}.stats.csv")
  
     if not args.force:
         for p in (frames_path, stats_path):
