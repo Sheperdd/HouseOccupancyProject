@@ -29,6 +29,7 @@ import pandas as pd
 
 from background import (
     BackgroundModel, N_CELLS, GRID, BOOTSTRAP_FRAMES, rc_to_idx, HOT_PIXELS,
+    MIN_BLOB_CELLS, label_blobs,
 )
 
 
@@ -68,22 +69,42 @@ def main(path):
 
     bg_start = list(m.bg)
     cell_fire_count = [0] * N_CELLS
-    occupied_frames = 0
+    occupied_frames_any = 0      # frames with >=1 cell fired
+    occupied_frames_gate = 0     # frames the GATE calls occupied (blob >= MIN)
+    blob_hist = {}               # how many frames had largest-blob-size == k
 
     for r in range(n):
         dist = [int(df.iloc[r][c]) for c in dcols]
         status = [int(df.iloc[r][c]) for c in scols]
         occ, dev = m.process(dist, status)
-        if occ:
+        # largest connected blob this frame -- mirrors the gate in process()
+        blobs = label_blobs(occ)
+        largest = 0
+        for b in blobs:
+            if len(b) > largest:
+                largest = len(b)
+        blob_hist[largest] = blob_hist.get(largest, 0) + 1
+        if len(occ) >= 1:
+            occupied_frames_any += 1
             for i in occ:
                 cell_fire_count[i] += 1
-            if len(occ) >= 1:
-                occupied_frames += 1
+        if largest >= MIN_BLOB_CELLS:
+            occupied_frames_gate += 1
 
     # ---- report ----
-    print(f"\n  frames with >=1 occupied cell: {occupied_frames} / {n} "
-          f"({100*occupied_frames/n:.1f}%)")
-    print("  (on empty_baseline this should be ~0)")
+    print(f"\n  frames with >=1 occupied cell: {occupied_frames_any} / {n} "
+          f"({100*occupied_frames_any/n:.1f}%)")
+    print(f"  frames the GATE calls occupied (largest blob >= {MIN_BLOB_CELLS} cells): "
+          f"{occupied_frames_gate} / {n} ({100*occupied_frames_gate/n:.1f}%)")
+    print("  (on empty_baseline the GATE number is what must be ~0)")
+
+    print("\n  largest-blob-size histogram (k = biggest connected blob in a "
+          "frame -> how many frames):")
+    print("  (on empty_baseline this must pile at 0-1; any connected blob >= "
+          f"{MIN_BLOB_CELLS} is a surprise to investigate)")
+    for k in sorted(blob_hist):
+        bar = "#" * min(60, blob_hist[k])
+        print(f"    {k:>2} cells: {blob_hist[k]:>4}  {bar}")
 
     print("\n  per-cell fire count (rows x cols, '.' = never fired):")
     print("        " + " ".join(f"c{c}" for c in range(GRID)))
@@ -102,7 +123,7 @@ def main(path):
         reverse=True,
     )[:5]
     for d, i in drift:
-        print(f"    cell ({i//GRID},{i%GRID}): {bg_start[i]:.0f} -> {m.bg[i]:.0f}  (Δ{d:.0f})")
+        print(f"    cell ({i//GRID},{i%GRID}): {bg_start[i]:.0f} -> {m.bg[i]:.0f}  (d={d:.0f})")
 
 
 if __name__ == "__main__":

@@ -113,6 +113,124 @@ any contradicting details in the phase descriptions below._
   Captured sessions archived as Phase 2 test fixtures: empty_baseline, walks_alternating_out_first,
   fast_walks_alternating_out_first, stop_in_doorway_out_first (+ matching stats files). 2026-06-07
 
+- **Phase 2** Detection core complete — Python golden reference validated against all fixtures
+  Detection algorithm designed and validated entirely in Python first (core/harness split:
+  portable plain-Python cores destined for the C port, numpy-heavy harness laptop-only). Two modules.
+  `background.py` — perception (which cells are occupied this frame):
+  - Per-cell background via median + MAD over a 150-frame bootstrap. Median tolerates a person
+    wandering through calibration; MAD gives each cell its own noise floor, so jittery edge cells
+    self-assign a higher threshold.
+  - Continuous gated EMA update (ALPHA=0.01): background learns only from frames deemed empty
+    (per-frame gate) AND never folds a cell into bg while that cell is individually flagged hot
+    (per-cell freeze). Per-frame gate stops absorbing a stationary person; per-cell freeze stops bg
+    chasing a flickering edge cell. Solves Phase 1 finding #3 (mount drift) without the
+    stop-in-doorway dissolve failure.
+  - Hysteresis (K_OCCUPY=6, K_CLEAR=4): high bar to declare a cell occupied, low bar to clear, so
+    boundary cells don't chatter.
+  - Hot-pixel mask stored as DATA (HOT_PIXELS tuple), not a hardcoded `if`, so it generalizes to
+    per-node auto-detection later.
+  `tracker.py` — temporal logic (what a sequence of frames amounts to):
+  - Detection by CONNECTIVITY, not magnitude: 8-connected largest-blob extraction (flood fill).
+    Discards scattered noise — fixes Phase 1 finding #6 (global centroid failed because it averaged
+    the person with stuck corner cells). 8-connectivity (incl. diagonals) because travel is diagonal
+    (finding #5); 4-conn would fragment the blob. Gate on largest-blob size.
+  - Deviation-weighted centroid: weights cells by depth deviation so the closest point
+    (head/shoulders, highest SNR) dominates and fringe-cell flicker barely moves the track. Yields
+    smooth sub-cell coordinates.
+  - Track lifecycle state machine (IDLE → ACTIVE → CLOSE) with GRACE_FRAMES=3 to bridge brief gate
+    dropouts (one dropped frame doesn't split a crossing) and MAX_TRACK_FRAMES=100 force-close
+    (bounds the C buffer; catches stuck furniture in FOV).
+  - Direction by projecting net displacement onto a per-node `in_axis` vector — NOT PCA. PCA's
+    eigenvector sign flips arbitrarily between crossings and can't label in vs out; in/out is an
+    irreducible physical fact about how the sensor sits relative to the two rooms, so it is
+    calibrated once per install. in_axis = −mean(known-out displacements), normalized. For this
+    node/mount: in_axis ≈ (−0.413, −0.911). MUST be recalibrated if the sensor is remounted.
+  - Crossing-vs-loiter by NET displacement, not path length: walk-in-stop-walk-back-out nets ≈ 0 →
+    no event (correct — occupancy didn't change); walk-through (even with a multi-second pause
+    mid-crossing) nets large → event. This subsumes the stop-in-doorway problem (finding #7) — net
+    displacement handles loiter-and-return as a natural zero, with no special-case plateau logic.
+    Plateau duration / path straightness feeds confidence only.
+  - Robust endpoints: start/end = mean of first/last k centroids, with k capped at frames//2 so the
+    windows never overlap (overlapping windows understate net displacement on short tracks and were
+    dropping fast crossings).
+  - Key tuning outcome — MIN_BLOB_CELLS = 4 (lowered from 5): a fast, low-signal crossing skims the
+  grid so quickly the connected blob crests ≥5 for only a single frame, though the crossing spans
+  ~10 frames of sub-gate occupancy and the centroid sweeps cleanly across. A one-frame track yields
+  no direction. The event was dying at the GATE — upstream of the displacement and track-length
+  knobs — so sweeping those (incl. MIN_NET_DISPLACEMENT down to 1) had zero effect. Found by
+  instrumenting actual frames, not tuning. Gate=4 recovers it; empty_baseline still emits 0 events
+  at gate=4, so it stays safe against noise. LESSON: when a parameter sweep bottoms out with no
+  effect, the problem is at a different stage than the knob — instrument, don't tune.
+  - Validation (all fixtures): empty_baseline → 0 events; walks_alternating_out_first → 8/8 crossings,
+  clean alternating direction; fast_walks → 8/8 alternating (held-out — in_axis derived from walks,
+  scored on fast); stop_in_doorway → 4/4 alternating (2 round-trips, each crossing with a 4–6 s
+  mid-pause; proves a pause neither splits the track nor suppresses the crossing). Meets the Phase 2
+  success criterion (≥80% correct direction) with large margin.
+  - Files: detector/{background,tracker}.py (portable cores — plain Python, no numpy, map 1:1 to C);
+  detector/{replay_background,replay_tracker}.py (laptop harness — numpy/pandas OK). Fixtures in
+  fixtures/. detector/ and fixtures/ live at the workspace root, siblings to doorway-node-01 (the
+  firmware project), keeping the core/harness boundary physical.
+  - Deferred debt: (a) bimodal edge cell (0,1) flickers between the doorframe and floor surfaces — no
+  single background value represents it; currently harmless because the blob gate discards it as an
+  isolated size-1 blob. Revisit as auto-detected unreliable-cell flagging during bootstrap when node
+  2 arrives (its defect map will differ — generalizes finding #4). (b) Two-people-simultaneous still
+  untested. 2026-06-07
+
+- **Phase 2** VL53L5CX datasheet review — capabilities affecting later phases
+  Reviewed the ST datasheet/ULD manual against current plans. Findings:
+  - Autonomous low-power mode with programmable interrupt threshold (`vl53l5cx_set_ranging_mode`,
+    `vl53l5cx_set_detection_thresholds`): the sensor can range autonomously and wake the host via its
+    INT pin on a threshold crossing. Answers the open Phase 2 power question — the sensor CAN wake the
+    host, so no continuous polling is required. Reshapes power design toward two tiers: a cheap
+    sensor-level trigger wakes the ESP32 from deep sleep, then the host runs the full pipeline to
+    confirm and get direction.
+  - Multitarget per zone (up to 4 targets): a tool for the deferred two-people problem (Phase 4); the
+    current firmware reads target 0 only.
+  - Per-zone motion indicator: a possible complementary detection or wake signal; likely redundant
+    given the clean depth signal — parked.
+  - CORRECTION: 60 Hz is a 4×4-only figure; 8×8 caps at 15 Hz. Current 10 Hz / 8×8 is well within
+    budget (Phase 1 headroom confirms ~15 Hz sustainable).
+  - Cover-glass crosstalk compensation works beyond 60 cm and has a calibration routine
+    (`vl53l5cx_calibrate_xtalk`) — relevant when the Phase 6 enclosure puts a window over the sensor.
+  2026-06-07
+
+- **Phase 2** Detector ported to C/ESP-IDF and integrated into firmware — native regression passes
+  The validated Python cores were ported to pure C (zero ESP-IDF deps, so the SAME source compiles
+  for the device and for a host-native test) and wired into the firmware frame loop. Done by Claude
+  Code from a handoff prompt (`claude-code-handoff-cport.md`).
+  - Files: `doorway-node-01/src/detection/{background,tracker}.{c,h}` (the port — pure C, `float`
+    math for the single-precision ESP32 FPU, fixed-size buffers, no heap in the hot path). Native
+    harness in `detector/native/`: `test_replay.c` driver, `Makefile` (standalone gcc — NOT a
+    PlatformIO `native` env, which fights the espidf toolchain), `gen_golden.py` (golden generator)
+    → `golden/*.txt`, and `run_regression.py` (tolerance gate: exact on direction/frames/peak/
+    t_start, ±0.05 cells on dx/dy/net, ±0.05 on confidence).
+  - Native regression PASSES all four fixtures: empty_baseline→0, walks→8 (out,in×4), fast_walks→8
+    (out,in×4, held-out), stop_in_doorway→4 (out,in×2). Matches the Python golden within tolerance.
+  - DECISION — `MIN_BLOB_CELLS = 4` in BOTH stages. During this session `background.py`'s bg-update
+    gate was changed 5→4 (it had been 5 in the validated run; `tracker.py`'s track gate was already
+    4). Rather than revert, kept 4 everywhere: re-ran the Python replay and confirmed gate=4 still
+    yields 0/8/8/4 with clean direction. Ported as two SEPARATE constants (`BG_MIN_BLOB_CELLS`,
+    `TRK_MIN_BLOB_CELLS`) — same value today but conceptually independent per-stage knobs; don't
+    collapse into one `#define`.
+  - DECISION — `in_axis` re-derived to ≈ (−0.456, −0.890) (was (−0.413, −0.911) at gate=5). The axis
+    is gate-dependent because it's computed from the out-crossing displacement vectors. Hardcoded as
+    `IN_AXIS_X/Y` in `tracker.h` and mirrored in `gen_golden.py`. STILL per-node/per-mount; MUST be
+    recalibrated on remount; becomes MQTT-configurable in Phase 3.
+  - Firmware integration: `main.c` copies each frame's 64 distances + 64 statuses into the detector,
+    bootstraps `BG_BOOTSTRAP_FRAMES` empty frames on boot (logs "calibrating… ~15s / ready"), then
+    emits `EVENT,<esp_timer_us>,<direction>,<net>,<confidence>,<peak_blob>` alongside the unchanged
+    FRAME/STATS lines. New sources auto-picked-up by the existing `GLOB_RECURSE` in
+    `src/CMakeLists.txt` (glob narrowed to `*.c`; added `INCLUDE_DIRS "." "detection"`). Builds clean
+    via PlatformIO: RAM 16.5% (53,956 B), Flash 24.8% — the static background model (per-cell
+    bootstrap buffer) fits with large margin; kept off the 7,168 B main-task stack via `static`.
+  - On-device lifecycle differs from the offline harness by design: the device starts detection only
+    AFTER the 150-frame bootstrap, whereas the harness reprocesses bootstrap frames. Harmless —
+    bootstrap frames are empty (calibration), so no real crossings are lost.
+  - NOT YET DONE (needs hardware on COM3, developer's step): flash + walk-through to confirm live
+    EVENT lines with correct direction and STATS still ~100 ms. Out of scope per the handoff: deep
+    sleep/power, store-and-forward, MQTT/networking, auto-detection of unreliable cells. 2026-06-07
+
+
 ---
 
 ## Project Overview

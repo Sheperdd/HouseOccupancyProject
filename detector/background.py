@@ -25,24 +25,90 @@ GRID = 8
 N_CELLS = GRID * GRID          # 64
 
 VALID_STATUS = (5, 9, 10, 255)  # Phase 1 finding #1
-HOT_PIXELS = (5,)               # flat index of cell (row=0,col=5) -> 0*8+5 = 5
+HOT_PIXELS = (1, 5)             # flat indices of masked cells:
+                                #   (row=0,col=1) -> 0*8+1 = 1  (bimodal flicker)
+                                #   (row=0,col=5) -> 0*8+5 = 5  (stuck hot pixel)
                                 # kept as DATA, not an `if` -- swap to per-node
                                 # auto-detection later by changing this tuple.
 
 # ---- tuning knobs (you will sweep these against the fixtures) -------------
-BOOTSTRAP_FRAMES = 50    # frames assumed empty at startup to seed bg
+BOOTSTRAP_FRAMES = 150   # frames assumed empty at startup to seed bg
+                         #   15s at 10Hz. Long enough for edge cells to show
+                         #   their full flicker range so MAD self-raises their
+                         #   threshold. In production this is your "stay out of
+                         #   the doorway for 15s after power-on" window.
 ALPHA = 0.01             # EMA learning rate; 1/ALPHA ~= frames to adapt
                          #   0.01 -> ~100 frames -> ~10s at 10Hz
 K_OCCUPY = 6.0           # occupied if dev > K_OCCUPY * mad   (declare)
 K_CLEAR  = 4.0           # clears  if dev < K_CLEAR  * mad   (hysteresis)
 MAD_FLOOR_MM = 15.0      # min noise floor so quiet cells aren't hair-trigger
-MIN_OCCUPIED_CELLS = 2   # frame is "occupied" if >= this many cells fire
+MIN_BLOB_CELLS = 4       # frame is "occupied" if the LARGEST connected blob
+                         #   has >= this many cells. A person is 20-32 cells;
+                         #   noise blobs are <=2, so 4 sits safely in the wide
+                         #   valley between them. An isolated flickering cell is a
+                         #   size-1 blob -> never trips the gate -> bg keeps
+                         #   learning everywhere else (this is what makes the
+                         #   bimodal (0,1) cell harmless without masking it).
 # ---------------------------------------------------------------------------
 
 
 def rc_to_idx(row, col):
     """Map (row, col) -> flat index. Keep one convention everywhere."""
     return row * GRID + col
+
+
+def label_blobs(occupied):
+    """
+    Flood-fill connected components over the occupied set.
+
+    Input : occupied -- list of flat cell indices (the output of process()).
+    Output: list of blobs, each blob a list of flat cell indices.
+
+    Connectivity is 8-CONNECTED (includes diagonals). Phase 1 finding #5 says
+    travel across the grid is diagonal, so a real person's footprint can be
+    diagonally linked; 4-connectivity would risk splitting one person into
+    fragments. The tradeoff -- 8-conn could merge two diagonally-touching
+    noise cells -- does not bite us because real noise here is corner-to-corner
+    and sparse, not adjacent.
+
+    Standalone and module-level on purpose: the tracker reuses this next.
+
+    C-PORT NOTE: the Python `set` for occupancy/visited becomes a
+    `bool occupied[64]` / `bool visited[64]` array, and the BFS queue becomes a
+    fixed-size `int stack[64]` with a top index -- trivial, no dynamic memory.
+    """
+    occ_set = set(occupied)
+    visited = set()
+    blobs = []
+
+    for start in occupied:
+        if start in visited:
+            continue
+        # iterative DFS from this seed cell over its connected component
+        component = []
+        stack = [start]
+        visited.add(start)
+        while stack:
+            cell = stack.pop()
+            component.append(cell)
+            row = cell // GRID
+            col = cell % GRID
+            # 8-connected neighborhood
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr = row + dr
+                    nc = col + dc
+                    if nr < 0 or nr >= GRID or nc < 0 or nc >= GRID:
+                        continue
+                    nb = nr * GRID + nc
+                    if nb in occ_set and nb not in visited:
+                        visited.add(nb)
+                        stack.append(nb)
+        blobs.append(component)
+
+    return blobs
 
 
 def _trusted(status, idx):
@@ -140,13 +206,27 @@ class BackgroundModel:
             if self._cell_hot[i]:
                 occupied.append(i)
 
-        frame_occupied = len(occupied) >= MIN_OCCUPIED_CELLS
+        # BLOB GATE: a frame is occupied only if its LARGEST connected blob is
+        # big enough. Counting raw fired cells (the old len(occupied) >= MIN
+        # test) let scattered isolated flicker masquerade as occupancy and, via
+        # the gate, corrupt the bg update. Requiring a connected blob means a
+        # lone size-1 cell (e.g. the bimodal (0,1) cell) never trips the gate,
+        # so bg keeps learning everywhere else.
+        blobs = label_blobs(occupied)
+        largest_blob = 0
+        for b in blobs:
+            if len(b) > largest_blob:
+                largest_blob = len(b)
+        frame_occupied = largest_blob >= MIN_BLOB_CELLS
 
-        # GATE: only learn background from frames that look empty.
-        # This is the fix for absorbing a stationary person (stop-in-doorway).
+        # GATE: only learn background from frames that look empty, AND never
+        # fold a cell into bg while that specific cell is currently flagged
+        # hot. Per-frame gate stops absorbing a stationary person; per-cell
+        # freeze stops bg from chasing a lone flickering edge cell.
         if not frame_occupied:
             for i in range(N_CELLS):
-                if self.calibrated[i] and _trusted(status, i):
+                if (self.calibrated[i] and _trusted(status, i)
+                        and not self._cell_hot[i]):
                     self.bg[i] = (1.0 - ALPHA) * self.bg[i] + ALPHA * dist[i]
 
         return occupied, dev

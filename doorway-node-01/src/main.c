@@ -23,6 +23,7 @@
 #include "driver/i2c_master.h" // The new ESP-IDF v5 I2C driver (master-mode API)
 #include "vl53l5cx_api.h"      // ST's official driver for the sensor
 #include "driver/uart.h"       // For UART configuration
+#include "detection/tracker.h" // Phase 2 detector port (pure C; pulls in background.h)
 
 // "Tag" used by the logging system. Every ESP_LOGI/ESP_LOGE line gets
 // prefixed with this so you can filter logs by subsystem in the serial monitor.
@@ -180,6 +181,18 @@ void app_main(void)
 
     int frame_count = 0;
 
+    // ----- Phase 2 detector state -------------------------------------------
+    // These structs are large (the background model carries a per-cell
+    // bootstrap sample buffer), so they MUST NOT live on app_main's stack —
+    // `static` puts them in BSS instead. The detector is pure C with no
+    // hardware coupling; all it sees are the 64 distances + 64 statuses.
+    static background_model_t bg;
+    static tracker_t tk;
+    bg_init(&bg);
+    tracker_init(&tk);
+    bool bg_ready = false;   // false until BOOTSTRAP_FRAMES empty frames seen
+    int boot_frames = 0;     // bootstrap frames collected so far
+
     // Timing accumulators — all in microseconds, all reset each STATS window.
     int64_t last_frame_us = 0;       // Timestamp of the most recent completed frame
     int64_t last_stats_us = 0;       // When we last emitted a STATS line
@@ -236,6 +249,59 @@ void app_main(void)
                 printf(",%d", Results.target_status[i]);
             }
             printf("\n");
+
+            // ----- Detection pipeline --------------------------------------
+            // Copy the sensor's frame into plain int arrays the detector
+            // expects (it is hardware-agnostic: int dist[64] / int status[64]).
+            int dist_i[64], status_i[64];
+            for (int i = 0; i < 64; i++)
+            {
+                dist_i[i] = Results.distance_mm[i];
+                status_i[i] = Results.target_status[i];
+            }
+
+            if (!bg_ready)
+            {
+                // Bootstrap: assume the doorway is empty for the first
+                // BG_BOOTSTRAP_FRAMES frames and seed the background model.
+                if (boot_frames == 0)
+                {
+                    ESP_LOGI(TAG, "Calibrating background — keep the doorway clear "
+                                  "(%d frames / ~%ds)...",
+                             BG_BOOTSTRAP_FRAMES, BG_BOOTSTRAP_FRAMES / 10);
+                }
+                bg_bootstrap_add(&bg, dist_i, status_i);
+                boot_frames++;
+                if (boot_frames >= BG_BOOTSTRAP_FRAMES)
+                {
+                    bg_bootstrap_finalize(&bg);
+                    bg_ready = true;
+                    ESP_LOGI(TAG, "Background calibrated (%d frames). Detection ready.",
+                             boot_frames);
+                }
+            }
+            else
+            {
+                // Steady state: perception -> largest blob -> tracker.
+                bool occ[64];
+                float dev[64];
+                bg_process(&bg, dist_i, status_i, occ, dev);
+
+                int cells[64];
+                int blob_n = det_largest_blob(occ, cells);
+
+                // esp_timer microseconds as the timestamp — no RTC until Phase 4
+                // NTP; relative uptime is fine. t only flows into t_start/t_end.
+                crossing_event_t ev = tracker_update(&tk, cells, blob_n, dev, after_read);
+                if (ev.valid)
+                {
+                    const char *dir = (ev.direction == DIR_IN) ? "in"
+                                    : (ev.direction == DIR_OUT) ? "out" : "none";
+                    // EVENT,<esp_timer_us>,<direction>,<net>,<confidence>,<peak_blob>
+                    printf("EVENT,%lld,%s,%.3f,%.3f,%d\n",
+                           after_read, dir, ev.net, ev.confidence, ev.peak_blob);
+                }
+            }
 
             // ----- Emit STATS line once per second -------------------------
             if (after_read - last_stats_us >= 1000000)
