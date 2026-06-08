@@ -74,7 +74,12 @@ static const char *TAG = "vl53l5cx";
 #define CAPTURE_MAX_FRAMES     300   // safety cap on one capture burst (~30s @10Hz)
 
 // Node operating tiers (see file header).
-typedef enum { STATE_CALIBRATING, STATE_ARMED, STATE_CAPTURING } node_state_t;
+typedef enum
+{
+    STATE_CALIBRATING,
+    STATE_ARMED,
+    STATE_CAPTURING
+} node_state_t;
 
 // Filled by the ISR, drained by the main task. One word per event.
 static QueueHandle_t vl53l5cx_queue = NULL;
@@ -256,10 +261,10 @@ void app_main(void)
     int boot_frames = 0;
 
     node_state_t state = STATE_CALIBRATING;
-    int empty_streak = 0;     // consecutive clear frames during a capture burst
-    int capture_frames = 0;   // length of the current burst (safety bound)
-    int max_blob = 0;         // diagnostic: peak largest-blob size seen this burst
-    int events_in_burst = 0;  // diagnostic: events emitted this burst
+    int empty_streak = 0;    // consecutive clear frames during a capture burst
+    int capture_frames = 0;  // length of the current burst (safety bound)
+    int max_blob = 0;        // diagnostic: peak largest-blob size seen this burst
+    int events_in_burst = 0; // diagnostic: events emitted this burst
 
     // Timing accumulators (microseconds) for the once-per-second STATS line,
     // emitted only while capturing.
@@ -325,8 +330,10 @@ void app_main(void)
 
         // FRAME line (offline capture / debugging).
         printf("FRAME,%d,%lld", frame_count, after_read);
-        for (int i = 0; i < 64; i++) printf(",%d", Results.distance_mm[i]);
-        for (int i = 0; i < 64; i++) printf(",%d", Results.target_status[i]);
+        for (int i = 0; i < 64; i++)
+            printf(",%d", Results.distance_mm[i]);
+        for (int i = 0; i < 64; i++)
+            printf(",%d", Results.target_status[i]);
         printf("\n");
 
         // -------------------- CALIBRATING -----------------------------------
@@ -356,7 +363,8 @@ void app_main(void)
         {
             int64_t period = after_read - last_frame_us;
             sum_frame_period_us += period;
-            if (period > max_frame_period_us) max_frame_period_us = period;
+            if (period > max_frame_period_us)
+                max_frame_period_us = period;
             periods_in_window++;
         }
         last_frame_us = after_read;
