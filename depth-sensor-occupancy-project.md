@@ -226,9 +226,7 @@ any contradicting details in the phase descriptions below._
   - On-device lifecycle differs from the offline harness by design: the device starts detection only
     AFTER the 150-frame bootstrap, whereas the harness reprocesses bootstrap frames. Harmless —
     bootstrap frames are empty (calibration), so no real crossings are lost.
-  - NOT YET DONE (needs hardware on COM3, developer's step): flash + walk-through to confirm live
-    EVENT lines with correct direction and STATS still ~100 ms. Out of scope per the handoff: deep
-    sleep/power, store-and-forward, MQTT/networking, auto-detection of unreliable cells. 2026-06-07
+  - NOT YET DONE deep sleep/power, store-and-forward, MQTT/networking, auto-detection of unreliable cells. 2026-06-07
 
 
 ---
