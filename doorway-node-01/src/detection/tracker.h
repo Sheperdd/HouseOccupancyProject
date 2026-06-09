@@ -16,18 +16,18 @@
 
 #include <stdbool.h>
 
-#include "background.h"   /* det_largest_blob, BG_N_CELLS */
+#include "background.h" /* det_largest_blob, BG_N_CELLS */
 
-#define TRK_GRID     8
-#define TRK_N_CELLS  64
+#define TRK_GRID 8
+#define TRK_N_CELLS 64
 
 /* ---- tuning knobs (mirror tracker.py exactly) ------------------------- */
-#define TRK_MIN_BLOB_CELLS       4     /* gate: track is occupied if largest blob >= this */
-#define TRK_GRACE_FRAMES         3     /* bridge brief gate dropouts without splitting a track */
-#define TRK_MAX_TRACK_FRAMES     100   /* force-close runaway tracks; also sizes the buffer */
-#define TRK_MIN_NET_DISPLACEMENT 2.0f  /* cells; below this, loiter/jitter -> no event */
-#define TRK_MIN_TRACK_FRAMES     3     /* reject ultra-short tracks */
-#define TRK_ENDPOINT_AVG         3     /* average first/last N centroids for robust endpoints */
+#define TRK_MIN_BLOB_CELLS 4          /* gate: track is occupied if largest blob >= this */
+#define TRK_GRACE_FRAMES 3            /* bridge brief gate dropouts without splitting a track */
+#define TRK_MAX_TRACK_FRAMES 100      /* force-close runaway tracks; also sizes the buffer */
+#define TRK_MIN_NET_DISPLACEMENT 1.5f /* cells; below this, loiter/jitter -> no event */
+#define TRK_MIN_TRACK_FRAMES 3        /* reject ultra-short tracks */
+#define TRK_ENDPOINT_AVG 3            /* average first/last N centroids for robust endpoints */
 
 /* Per-node / per-mount install constant. Re-derived from the gate=4 source on
  * the walks fixture. MUST be recalibrated if the sensor is remounted; will
@@ -35,39 +35,59 @@
 #define IN_AXIS_X (-0.456f)
 #define IN_AXIS_Y (-0.890f)
 
-typedef enum {
+typedef enum
+{
     DIR_NONE = -1,
-    DIR_OUT  = 0,
-    DIR_IN   = 1
+    DIR_OUT = 0,
+    DIR_IN = 1
 } direction_t;
 
-typedef struct {
-    bool        valid;       /* true only for a real emitted crossing */
-    direction_t direction;
-    long long   t_start;
-    long long   t_end;
-    int         frames;      /* lifecycle frame count (incl. grace frames) */
-    float       dx, dy;      /* net displacement components (cells) */
-    float       net;         /* |displacement| (cells) */
-    float       path;        /* summed path length (cells) */
-    float       confidence;  /* 0..1 (straightness) */
-    int         peak_blob;   /* peak largest-blob size over the track */
-} crossing_event_t;
+/* Why the last track close did (or didn't) emit. Diagnostics only -- does NOT
+ * affect the event contract or the native regression (which scores events). */
+typedef enum
+{
+    TRK_CLOSE_NONE = 0,       /* no track has closed yet */
+    TRK_CLOSE_EMITTED,        /* passed all gates -> event emitted */
+    TRK_CLOSE_NOT_ACTIVE,     /* closed with no active track */
+    TRK_CLOSE_TOO_FEW_FRAMES, /* n_centroids < TRK_MIN_TRACK_FRAMES */
+    TRK_CLOSE_NET_TOO_SMALL   /* net < TRK_MIN_NET_DISPLACEMENT */
+} trk_close_reason_t;
 
-typedef struct {
-    float     cx[TRK_MAX_TRACK_FRAMES];
-    float     cy[TRK_MAX_TRACK_FRAMES];
-    int       sizes[TRK_MAX_TRACK_FRAMES];
-    int       n_centroids;   /* stored centroids (<= TRK_MAX_TRACK_FRAMES) */
+typedef struct
+{
+    bool valid; /* true only for a real emitted crossing */
+    direction_t direction;
     long long t_start;
     long long t_end;
-    int       frames;        /* occupied-frame count for this track */
-    bool      active;
+    int frames;       /* lifecycle frame count (incl. grace frames) */
+    float dx, dy;     /* net displacement components (cells) */
+    float net;        /* |displacement| (cells) */
+    float path;       /* summed path length (cells) */
+    float confidence; /* 0..1 (straightness) */
+    int peak_blob;    /* peak largest-blob size over the track */
+} crossing_event_t;
+
+typedef struct
+{
+    float cx[TRK_MAX_TRACK_FRAMES];
+    float cy[TRK_MAX_TRACK_FRAMES];
+    int sizes[TRK_MAX_TRACK_FRAMES];
+    int n_centroids; /* stored centroids (<= TRK_MAX_TRACK_FRAMES) */
+    long long t_start;
+    long long t_end;
+    int frames; /* occupied-frame count for this track */
+    bool active;
 } track_t;
 
-typedef struct {
+typedef struct
+{
     track_t track;
-    int     grace;
+    int grace;
+    /* diagnostics: updated on every tracker_close (emitted or rejected) so the
+     * caller can see WHY a fat blob produced no event. Read-only for callers. */
+    trk_close_reason_t last_reason;
+    float last_net;       /* net displacement at last close (cells) */
+    int last_n_centroids; /* centroids stored at last close */
 } tracker_t;
 
 void tracker_init(tracker_t *tk);

@@ -46,7 +46,10 @@ static crossing_event_t tracker_close(tracker_t *tk)
     tk->grace = 0;
 
     int n = tr->n_centroids;
+    tk->last_n_centroids = n;
+    tk->last_net = 0.0f;
     if (!was_active || n < TRK_MIN_TRACK_FRAMES) {
+        tk->last_reason = was_active ? TRK_CLOSE_TOO_FEW_FRAMES : TRK_CLOSE_NOT_ACTIVE;
         return ev;
     }
 
@@ -73,6 +76,7 @@ static crossing_event_t tracker_close(tracker_t *tk)
     float dx = ex - sx;
     float dy = ey - sy;
     float net = sqrtf(dx * dx + dy * dy);
+    tk->last_net = net;
 
     /* path length (for straightness / confidence) */
     float path = 0.0f;
@@ -84,6 +88,7 @@ static crossing_event_t tracker_close(tracker_t *tk)
 
     /* debounce: loiter-and-return or jitter -> no crossing */
     if (net < TRK_MIN_NET_DISPLACEMENT) {
+        tk->last_reason = TRK_CLOSE_NET_TOO_SMALL;
         return ev;
     }
 
@@ -107,6 +112,7 @@ static crossing_event_t tracker_close(tracker_t *tk)
         }
     }
 
+    tk->last_reason = TRK_CLOSE_EMITTED;
     ev.valid = true;
     ev.direction = direction;
     ev.t_start = tr->t_start;
@@ -129,6 +135,9 @@ void tracker_init(tracker_t *tk)
     tk->track.t_start = 0;
     tk->track.t_end = 0;
     tk->grace = 0;
+    tk->last_reason = TRK_CLOSE_NONE;
+    tk->last_net = 0.0f;
+    tk->last_n_centroids = 0;
 }
 
 crossing_event_t tracker_update(tracker_t *tk,

@@ -228,6 +228,96 @@ any contradicting details in the phase descriptions below._
     bootstrap frames are empty (calibration), so no real crossings are lost.
   - NOT YET DONE deep sleep/power, store-and-forward, MQTT/networking, auto-detection of unreliable cells. 2026-06-07
 
+- **Phase 2** Power management — two-tier wake/capture state machine (IN PROGRESS, not finished)
+  Began the battery-operation work. The validated detector needs a DENSE continuous frame stream, so
+  it cannot run on the sparse, motion-triggered frames the sensor's low-power mode produces. Resolved
+  this with the two-tier design flagged in the datasheet-review entry: a cheap WAKE tier that only
+  signals "something moved", and a CAPTURE tier that streams continuously and runs the full detector.
+  - HARDWARE: sensor INT (open-drain, active-low) → ESP32 **GPIO 4**. Chosen because it's RTC-capable
+    (needed for deep-sleep wake later), not a strapping pin, and free. Pull-up: started with the
+    datasheet-specified external 47k to IOVDD, then switched to the ESP32's INTERNAL pull-up
+    (~45k, `gpio_set_pull_mode(..., GPIO_PULLUP_ONLY)`) to simplify wiring. CAVEAT recorded in code:
+    internal pull-ups power off in deep sleep — deep sleep will need `rtc_gpio_pullup_en()` on GPIO 4;
+    light sleep retains it. INT is open-drain so it needs a pull-up at all (the sensor can only pull
+    LOW); the sensor is powered via its own supply pins, INT is just a signal output.
+  - EMPIRICAL FINDING: the INT pin only fires in **AUTONOMOUS mode with detection thresholds**, NOT in
+    continuous ranging. So continuous capture uses I2C `check_data_ready` polling; the wake tier uses
+    the INT.
+  - FIRMWARE (`doorway-node-01/src/main.c`): three-state machine.
+    * CALIBRATING — continuous 8x8 @10Hz; seed background over `BG_BOOTSTRAP_FRAMES` clear frames; arm.
+    * ARMED — autonomous 8x8 @`ARMED_FREQ_HZ` (5) + motion indicator + per-zone detection thresholds
+      (`GREATER_THAN_MAX`, level `MOTION_THRESHOLD`=44, distance window 500–1999 mm). Sensor pulses
+      INT on motion; an ISR pushes a token to a FreeRTOS queue; the task blocks on `xQueueReceive`.
+      **This is where ESP32 sleep will go (TODO(power) marker in the code).**
+    * CAPTURING — switch to continuous @10Hz, run the detector (bg_process → largest blob → tracker),
+      emit `EVENT` lines, until the doorway is clear for `CAPTURE_IDLE_FRAMES` (~2s) or a
+      `CAPTURE_MAX_FRAMES` safety cap, then re-arm.
+    * Mode switches via helpers `sensor_start_continuous()` / `sensor_arm_autonomous()` (stop →
+      reconfigure → start; thresholds disabled in continuous, re-applied on every arm).
+  - ISR→QUEUE pattern (and WHY): an ISR runs in interrupt context — no I2C, no printf, no blocking —
+    so it can only signal. The queue carries that signal to the task, and (unlike a flag) lets the
+    task BLOCK/sleep instead of busy-polling — which is the hook the coming light-sleep depends on.
+  - Secondary fixes folded in from the example port: detection threshold low/high both = 44 (was 500,
+    far too insensitive); sensor-config return codes now checked.
+  - KNOWN OPEN ISSUE (where this session stopped): wake-then-capture inherently misses the
+    *pre-trigger* part of the crossing, and the lost portion is DIRECTION-DEPENDENT. On hardware,
+    walking "in" emits a correct EVENT, but walking "out" yields a solid blob (peak ~12 cells) whose
+    track is rejected (too few frames / net displacement < 2 cells) → no event. Also occasional
+    spurious re-wake bursts (peak blob 1, 0 events) right after a crossing. A burst diagnostic was
+    added: `ESP_LOGI("Burst done: N frames, peak blob X, Y events")`. (Note: a deeper per-reject
+    diagnostic — a `closed` flag on the event — was prototyped then reverted; the detector core is
+    unchanged and still passes all four native regression fixtures.)
+  - NEXT STEPS / DECISION PENDING:
+    1. Shrink the wake→capture latency that clips "out": raise `ARMED_FREQ_HZ` toward 10–15 and trim
+       the mode-switch overhead. If clipping persists, reconsider the architecture — keep the sensor
+       ranging continuously and only light-sleep the ESP32 during idle (more sensor power, full
+       crossings) vs. living with directional clipping.
+    2. Implement ESP32 **LIGHT** sleep at the ARMED `TODO` (`esp_sleep_enable_gpio_wakeup` +
+       `gpio_wakeup_enable(SENSOR_INT_GPIO, GPIO_INTR_LOW_LEVEL)` + `esp_light_sleep_start`). LIGHT,
+       not deep: deep sleep loses RAM and would force the 2–3 s `vl53l5cx_init` firmware re-upload on
+       every wake, missing the very crossing that woke it. Deep sleep is reserved for long idle
+       windows (e.g. overnight) only.
+    3. Measure actual power draw with a multimeter (the Phase 6 power-profiling task).
+  2026-06-08
+
+- **Phase 2** Power management — ESP32 light sleep implemented at the ARMED tier (implementation done, validation open)
+  Implemented the `TODO(power)` from the previous entry. The ARMED tier now actually halts the ESP32
+  CPU instead of busy-blocking on a FreeRTOS queue.
+  - FIRMWARE (`doorway-node-01/src/main.c`): in the ARMED branch the blocking `xQueueReceive(...,
+    portMAX_DELAY)` was replaced with a light-sleep cycle: `gpio_wakeup_enable(SENSOR_INT_GPIO,
+    GPIO_INTR_LOW_LEVEL)` → `esp_sleep_enable_gpio_wakeup()` → `fflush(stdout)` →
+    `esp_light_sleep_start()` → on wake `gpio_wakeup_disable(SENSOR_INT_GPIO)`. The existing
+    ACK-the-INT + motion-validate gate (check_data_ready/get_ranging_data + peak-aggregate ≥
+    MOTION_THRESHOLD) runs unchanged after wake. The now-unused `event` queue token var was removed;
+    the ISR/queue are left installed (harmless — every path still `xQueueReset()`s).
+  - WHY LIGHT, NOT DEEP (confirmed via ESP-IDF docs `/espressif/esp-idf`): light sleep retains RAM and
+    the internal pull-up on GPIO 4, so the sensor firmware (~80 KB / 2-3 s I2C upload) and the
+    calibrated background survive the sleep. Deep sleep wipes both and would re-upload firmware on
+    every wake, missing the crossing that woke it. Deep sleep stays reserved for long idle windows.
+  - GPIO WAKE IS LEVEL-ONLY: light-sleep GPIO wake doesn't support edge triggers, so we wake on the
+    INT's active-LOW level. Safe because the sensor releases INT high once we read the frame (the ACK),
+    so the next `esp_light_sleep_start()` doesn't trip instantly on a still-low line.
+  - UART GOTCHA (hit + fixed): `uart_wait_tx_done()` requires a `uart_driver_install`'d port; the
+    console UART has none, so it logged `E uart: uart_wait_tx_done(...): uart driver error` every
+    cycle. The supported driver-free way to avoid the sleep truncating a log line is
+    `esp_sleep_set_console_uart_handling_mode(ESP_SLEEP_ALWAYS_FLUSH_UART)` (set once at startup) — then
+    `esp_light_sleep_start()` drains the console TX FIFO itself. Both `uart_wait_tx_done` calls removed
+    (the boot-time one had the same latent bug; replaced with a short `vTaskDelay` before the baud
+    change). `#include "esp_sleep.h"` added.
+  - STILL OPEN (validation, not code):
+    1. MEASURE it — no proof yet that light sleep engages or what current floor it hits. Meter the node;
+       confirm ARMED drops to the hundreds-of-µA CPU range. (Blocked on buying the multimeter; this is
+       the Phase 6 power-profiling task pulled forward.)
+    2. SENSOR is now the power floor — autonomous ranging + I2C pull-ups draw even while the ESP32
+       sleeps; light sleep can't cut that. If the floor is too high, tune ARMED_FREQ_HZ / integration
+       time or revisit pull-up values.
+    3. DEEP SLEEP for long idle (overnight) remains a bigger, separate task: needs `rtc_gpio_pullup_en`
+       on GPIO 4 (internal pull-ups die in deep sleep) + firmware re-upload + background re-seed on wake.
+       Only pursue if light-sleep floor proves insufficient — measurement decides.
+  - UNCHANGED / STILL OPEN from prior entries: the directional clipping bug (wake→capture latency drops
+    short "in"/"out" tracks) is independent of this power work and still open. Detector core untouched;
+    native regression still 0/8/8/4. 2026-06-08
+
 
 ---
 

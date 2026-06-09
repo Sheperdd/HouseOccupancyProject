@@ -32,6 +32,7 @@
 #include "esp_err.h"                              // ESP_ERROR_CHECK — aborts the program on a hardware error
 #include "esp_timer.h"                            // esp_timer_get_time() — microsecond-resolution uptime for timestamps
 #include "esp_system.h"                           // esp_chip_info() — get info about the ESP32 chip we're running on
+#include "esp_sleep.h"                            // esp_light_sleep_start() + GPIO wake source (Phase 2 power)
 #include "driver/i2c_master.h"                    // The new ESP-IDF v5 I2C driver (master-mode API)
 #include "vl53l5cx_api.h"                         // ST's official driver for the sensor
 #include "vl53l5cx_plugin_motion_indicator.h"     // Motion indicator plugin (autonomous wake)
@@ -64,14 +65,17 @@ static const char *TAG = "vl53l5cx";
 #define SENSOR_I2C_FREQ 400000
 
 // ---- two-tier mode parameters ---------------------------------------------
-#define VL53L5CX_THRESHOLD_EVENT 1   // token the ISR pushes into the queue
-#define MOTION_THRESHOLD       44    // motion-indicator level that counts as movement
-                                     //   (ST's example value; tune for your doorway)
-#define CAPTURE_FREQ_HZ        10    // continuous ranging rate while capturing a crossing
-#define ARMED_FREQ_HZ          5     // autonomous ranging rate while waiting for motion
-#define ARMED_INTEGRATION_MS   10    // integration time in autonomous mode
-#define CAPTURE_IDLE_FRAMES    20    // re-arm after this many consecutive clear frames (~2s @10Hz)
-#define CAPTURE_MAX_FRAMES     300   // safety cap on one capture burst (~30s @10Hz)
+#define VL53L5CX_THRESHOLD_EVENT 1 // token the ISR pushes into the queue
+#define MOTION_THRESHOLD 60        // motion-indicator level that counts as movement
+                                   //   (ST's example value). Lower = wakes EARLIER
+                                   //   (person at FOV edge, not center) = less of the
+                                   //   crossing clipped before CAPTURING starts. Also
+                                   //   the floor for the wake-validation gate in ARMED.
+#define CAPTURE_FREQ_HZ 10         // continuous ranging rate while capturing a crossing
+#define ARMED_FREQ_HZ 10           // autonomous ranging rate while waiting for motion
+#define ARMED_INTEGRATION_MS 10    // integration time in autonomous mode
+#define CAPTURE_IDLE_FRAMES 30     // re-arm after this many consecutive clear frames (~3s @10Hz)
+#define CAPTURE_MAX_FRAMES 300     // safety cap on one capture burst (~30s @10Hz)
 
 // Node operating tiers (see file header).
 typedef enum
@@ -121,7 +125,7 @@ static uint8_t sensor_arm_autonomous(VL53L5CX_Configuration *Dev,
     s |= vl53l5cx_set_resolution(Dev, VL53L5CX_RESOLUTION_8X8);
     s |= vl53l5cx_motion_indicator_init(Dev, mc, VL53L5CX_RESOLUTION_8X8);
     // Motion distance window 0.5–2.0 m (constraints: span < 1500 mm, min > 400 mm).
-    s |= vl53l5cx_motion_indicator_set_distance_motion(Dev, mc, 500, 1999);
+    s |= vl53l5cx_motion_indicator_set_distance_motion(Dev, mc, 400, 1500);
     s |= vl53l5cx_set_ranging_mode(Dev, VL53L5CX_RANGING_MODE_AUTONOMOUS);
     s |= vl53l5cx_set_ranging_frequency_hz(Dev, ARMED_FREQ_HZ);
     s |= vl53l5cx_set_integration_time_ms(Dev, ARMED_INTEGRATION_MS);
@@ -157,11 +161,16 @@ void app_main(void)
 
     // Scratch for return codes / flags. The ST driver returns 0 on success.
     uint8_t status, isAlive, isReady;
-    uint32_t event;
 
     fflush(stdout);                                   // Flush any buffered output before we reconfigure UART
-    uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(10)); // Let pending UART output drain
+    vTaskDelay(pdMS_TO_TICKS(20));                     // Let pending UART output drain (no driver installed, so
+                                                       //   uart_wait_tx_done can't be used — a short delay suffices)
     uart_set_baudrate(UART_NUM_0, 921600);            // 921600 baud keeps up with 10+ FPS of 8x8 frames
+
+    // Light sleep (ARMED tier) must flush the console UART FIFO before halting,
+    // or the last log line is cut off. The console port has no driver, so this
+    // sleep-time flush mode is the supported way to do it (not uart_wait_tx_done).
+    esp_sleep_set_console_uart_handling_mode(ESP_SLEEP_ALWAYS_FLUSH_UART);
 
     // ------------------------------------------------------------------------
     // Step 1: Set up the I2C bus
@@ -287,10 +296,78 @@ void app_main(void)
         // -------------------- ARMED: low-power wait for motion --------------
         if (state == STATE_ARMED)
         {
-            // Block until the sensor's INT fires (motion crossed the threshold).
-            // TODO(power): replace this blocking receive with light sleep + GPIO
-            // wake so the ESP32 itself sleeps while the sensor watches.
-            xQueueReceive(vl53l5cx_queue, &event, portMAX_DELAY);
+            // LIGHT SLEEP until the sensor's INT pulls the line LOW. The ESP32
+            // halts its CPU (drops from ~mA to hundreds of uA) while the sensor
+            // keeps ranging autonomously on its own. Light, NOT deep: deep sleep
+            // wipes RAM, which would force re-uploading the sensor firmware
+            // (~80 KB over I2C, 2-3 s) and re-seeding the background every wake.
+            //
+            // GPIO light-sleep wake is LEVEL-triggered only (edge isn't supported
+            // in light sleep), and INT is active-low, so we wake on LOW. The
+            // sensor holds INT low only until we read a frame; the ACK below
+            // clears it back high, so the next sleep won't trip instantly.
+            gpio_wakeup_enable(SENSOR_INT_GPIO, GPIO_INTR_LOW_LEVEL);
+            esp_sleep_enable_gpio_wakeup();
+
+            // Drain serial so the sleep doesn't truncate a half-printed line.
+            // The FIFO itself is flushed by esp_light_sleep_start() because we
+            // set ESP_SLEEP_ALWAYS_FLUSH_UART once at startup; fflush() just
+            // pushes libc's buffer into that FIFO first. (Do NOT use
+            // uart_wait_tx_done here -- it needs a uart_driver_install'd port,
+            // which the console UART is not, and errors every cycle.)
+            fflush(stdout);
+
+            esp_light_sleep_start(); // <-- CPU stops here until INT goes LOW
+
+            // Awake. Drop the level wake source while we service the sensor. The
+            // edge ISR may push a token while INT is still low here; harmless --
+            // the xQueueReset() below clears it.
+            gpio_wakeup_disable(SENSOR_INT_GPIO);
+
+            // ACK the wake at the sensor. ST's ULD requires check_data_ready +
+            // get_ranging_data to clear the data-ready status that the INT line
+            // mirrors; skipping it (the old code did) left the autonomous
+            // interrupt asserted across the mode switch — half the cause of the
+            // spurious second burst. INT guarantees a frame is coming, so poll
+            // briefly for it rather than assuming it's already latched.
+            isReady = 0;
+            for (int tries = 0; tries < 5 && !isReady; tries++)
+            {
+                vl53l5cx_check_data_ready(&Dev, &isReady);
+                if (!isReady)
+                    vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            if (isReady)
+                vl53l5cx_get_ranging_data(&Dev, &Results);
+
+            // VALIDATE the wake against the same motion the sensor's per-zone
+            // checkers evaluate. A freshly re-armed motion indicator (re-init'd
+            // every arm) plus residual motion from the person who just left can
+            // trip INT once with no real crossing; requiring a live aggregate
+            // above MOTION_THRESHOLD drops that false wake.
+            //   NOTE: the 64 detection-threshold checkers are per-zone, but the
+            //   readback motion[] array is hardware-capped at 32 aggregates
+            //   (map_id[64] folds the 64 zones onto <=32). Scan nb_of_aggregates
+            //   (<=32) — indexing motion[i] for i>=32 overruns the array.
+            uint32_t peak_motion = 0;
+            uint8_t n_aggr = Results.motion_indicator.nb_of_aggregates;
+            if (n_aggr > 32)
+                n_aggr = 32; // defensive: motion[] is only 32 wide
+            for (uint8_t i = 0; i < n_aggr; i++)
+                if (Results.motion_indicator.motion[i] > peak_motion)
+                    peak_motion = Results.motion_indicator.motion[i];
+
+            xQueueReset(vl53l5cx_queue); // drop arm-transient / queued INT pulses
+
+            if (!isReady || peak_motion < MOTION_THRESHOLD)
+            {
+                // False wake: no aggregate actually moving. Stay ARMED — the
+                // sensor is still ranging autonomously, INT is now cleared, and
+                // the next real motion will re-fire it.
+                // ESP_LOGI(TAG, "Wake ignored: peak motion %lu < %d — re-armed.",
+                //          (unsigned long)peak_motion, MOTION_THRESHOLD);
+                continue;
+            }
 
             if (sensor_start_continuous(&Dev))
             {
@@ -303,7 +380,8 @@ void app_main(void)
             events_in_burst = 0;
             last_frame_us = 0;
             last_stats_us = esp_timer_get_time();
-            ESP_LOGI(TAG, "Motion detected — capturing.");
+            ESP_LOGI(TAG, "Motion detected (peak %lu) — capturing.",
+                     (unsigned long)peak_motion);
             continue;
         }
 
@@ -385,9 +463,12 @@ void app_main(void)
         }
 
         // Is the doorway clear this frame (no qualifying blob)?
-        if (blob_n < TRK_MIN_BLOB_CELLS) empty_streak++;
-        else empty_streak = 0;
-        if (blob_n > max_blob) max_blob = blob_n;
+        if (blob_n < TRK_MIN_BLOB_CELLS)
+            empty_streak++;
+        else
+            empty_streak = 0;
+        if (blob_n > max_blob)
+            max_blob = blob_n;
         capture_frames++;
 
         // STATS once per second during capture.
@@ -418,7 +499,11 @@ void app_main(void)
         if (empty_streak >= CAPTURE_IDLE_FRAMES || capture_frames >= CAPTURE_MAX_FRAMES)
         {
             crossing_event_t fev = tracker_flush(&tk);
-            if (fev.valid) { emit_event(&fev, esp_timer_get_time()); events_in_burst++; }
+            if (fev.valid)
+            {
+                emit_event(&fev, esp_timer_get_time());
+                events_in_burst++;
+            }
             if (sensor_arm_autonomous(&Dev, &motion_config, thresholds))
             {
                 ESP_LOGE(TAG, "Failed to re-arm autonomous mode");
@@ -431,6 +516,22 @@ void app_main(void)
             //                                   too small (capture-start latency)
             ESP_LOGI(TAG, "Burst done: %d frames, peak blob %d cells, %d events — armed.",
                      capture_frames, max_blob, events_in_burst);
+            // REJECT DIAGNOSTIC: when a fat blob emits no event, this says which
+            // gate killed the track and the actual net displacement (cells).
+            //   net_too_small -> capture-start latency clipped the crossing
+            //   too_few_frames -> track shorter than TRK_MIN_TRACK_FRAMES
+            if (events_in_burst == 0 && max_blob >= TRK_MIN_BLOB_CELLS)
+            {
+                const char *why =
+                    (tk.last_reason == TRK_CLOSE_NET_TOO_SMALL)    ? "net_too_small"
+                    : (tk.last_reason == TRK_CLOSE_TOO_FEW_FRAMES) ? "too_few_frames"
+                    : (tk.last_reason == TRK_CLOSE_NOT_ACTIVE)     ? "not_active"
+                    : (tk.last_reason == TRK_CLOSE_NONE)           ? "never_closed"
+                                                                   : "emitted?";
+                ESP_LOGW(TAG, "  reject: %s (net=%.2f cells, centroids=%d, need net>=%.1f & frames>=%d)",
+                         why, tk.last_net, tk.last_n_centroids,
+                         (float)TRK_MIN_NET_DISPLACEMENT, TRK_MIN_TRACK_FRAMES);
+            }
             state = STATE_ARMED;
         }
     }
