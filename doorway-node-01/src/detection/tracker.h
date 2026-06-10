@@ -25,7 +25,7 @@
 #define TRK_MIN_BLOB_CELLS 4          /* gate: track is occupied if largest blob >= this */
 #define TRK_GRACE_FRAMES 3            /* bridge brief gate dropouts without splitting a track */
 #define TRK_MAX_TRACK_FRAMES 100      /* force-close runaway tracks; also sizes the buffer */
-#define TRK_MIN_NET_DISPLACEMENT 1.5f /* cells; below this, loiter/jitter -> no event */
+#define TRK_MIN_NET_DISPLACEMENT 1.2f /* cells; below this, loiter/jitter -> no event */
 #define TRK_MIN_TRACK_FRAMES 3        /* reject ultra-short tracks */
 #define TRK_ENDPOINT_AVG 3            /* average first/last N centroids for robust endpoints */
 

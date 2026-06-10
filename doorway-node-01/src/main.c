@@ -93,7 +93,7 @@ static const char *TAG = "vl53l5cx";
 #define CAPTURE_FREQ_HZ 10         // continuous ranging rate while capturing a crossing
 #define ARMED_FREQ_HZ 10           // autonomous ranging rate while waiting for motion
 #define ARMED_INTEGRATION_MS 10    // integration time in autonomous mode
-#define CAPTURE_IDLE_FRAMES 30     // re-arm after this many consecutive clear frames (~3s @10Hz)
+#define CAPTURE_IDLE_FRAMES 20     // re-arm after this many consecutive clear frames (~2s @10Hz)
 #define CAPTURE_MAX_FRAMES 300     // safety cap on one capture burst (~30s @10Hz)
 
 // ---- status/signal instrumentation (detection-review.md item E1) -----------
@@ -120,11 +120,16 @@ static int stat_bucket(uint8_t s)
 {
     switch (s)
     {
-    case 5:   return 0;
-    case 9:   return 1;
-    case 10:  return 2;
-    case 255: return 3;
-    default:  return 4;
+    case 5:
+        return 0;
+    case 9:
+        return 1;
+    case 10:
+        return 2;
+    case 255:
+        return 3;
+    default:
+        return 4;
     }
 }
 
@@ -243,33 +248,62 @@ static uint8_t sensor_arm_autonomous(VL53L5CX_Configuration *Dev,
 // the distance checker, half keep motion. A person's blob spans 20+ cells at
 // peak (Phase 1), so either checker type sees them — the OR happens spatially.
 // Conveniently, hot pixels 1 and 5 land on the motion side of this parity.
-#define WAKE_DIST_MIN_MM 500  // person-height return window (review C3): below
-#define WAKE_DIST_MAX_MM 1900 //   = too close (noise), above = floor/background
-#define WAKE_BG_MARGIN_MM 100 // keep-out margin around the window vs calibrated bg
+#define WAKE_DIST_MIN_MM 500     // below this = too close / noise
+#define WAKE_DIST_CAP_MM 1900    // absolute window ceiling
+#define WAKE_BG_CLEARANCE_MM 400 // return must be >= this much CLOSER than the
+                                 //   zone's calibrated background to count.
+                                 //   A fixed ceiling near the floor distance
+                                 //   (~2000mm) lets floor noise dip into the
+                                 //   window -> INT storm. Per-zone ceiling =
+                                 //   bg - clearance keeps the floor out by a
+                                 //   real margin; a person's head/shoulders
+                                 //   (600-900mm deviation, Phase 1) clears it
+                                 //   easily. 400 not 300: bimodal edge cells
+                                 //   (zone 13's doorframe flicker, ~320mm dev,
+                                 //   status 5) slipped a 300mm clearance.
+#define WAKE_ZONE_MAX_STRIKES 2  // a distance zone whose wakes yield this many
+                                 //   EMPTY bursts (no blob, no events) is a
+                                 //   bimodal/flicker cell the clearance math
+                                 //   can't see (rare second surface => median
+                                 //   bg and MAD both miss it). Demote it to a
+                                 //   motion checker until reboot/recalib —
+                                 //   self-healing per mount, no hand mask.
 
 // (Re)build the 64-checker array before each arm. Motion zones get the current
 // trip level (MQTT-configurable, review's set_motion_threshold role). Distance
-// zones get the IN_WINDOW checker — UNLESS that zone's calibrated background
-// already sits in/near the window (doorframe edge, furniture): a static return
-// inside the window would assert INT permanently and the node would never
-// idle, so those zones fall back to motion. dist_zone[] records the final
-// assignment for the wake-validation gate. Rebuilt at every arm, so it tracks
-// the EMA-drifting background for free.
+// zones get an IN_WINDOW checker whose ceiling is derived per-zone from the
+// calibrated background (hardware bg-subtraction: "something significantly
+// closer than this zone's floor"). Zones with no calibrated bg, or whose bg is
+// so close that the window collapses (doorframe edge, furniture), fall back to
+// motion — a static in-window return would assert INT permanently and the node
+// would never idle. dist_zone[]/dist_high[] record the final assignment for
+// the wake-validation gate. Rebuilt at every arm, so it tracks EMA drift.
 static void build_wake_thresholds(VL53L5CX_DetectionThresholds *thr, int motion_level,
-                                  const background_model_t *bg, bool dist_zone[64])
+                                  const background_model_t *bg,
+                                  const uint8_t strikes[64],
+                                  bool dist_zone[64], int dist_high[64])
 {
     memset(thr, 0, VL53L5CX_NB_THRESHOLDS * sizeof(*thr));
     for (int i = 0; i < 64; i++)
     {
         int row = i / 8, col = i % 8;
         bool want_dist = ((row + col) % 2) == 0;
+        int high = 0;
         if (want_dist)
         {
-            if (!bg->calibrated[i])
-                want_dist = false; // unknown background: motion is the safe checker
-            else if (bg->bg[i] > (float)(WAKE_DIST_MIN_MM - WAKE_BG_MARGIN_MM) &&
-                     bg->bg[i] < (float)(WAKE_DIST_MAX_MM + WAKE_BG_MARGIN_MM))
-                want_dist = false; // static scene inside the window: would INT-storm
+            if (!bg->calibrated[i] || strikes[i] >= WAKE_ZONE_MAX_STRIKES)
+            {
+                want_dist = false; // unknown background / struck-out flicker
+                                   // cell: motion is the safe checker
+            }
+            else
+            {
+                high = (int)bg->bg[i] - WAKE_BG_CLEARANCE_MM;
+                if (high > WAKE_DIST_CAP_MM)
+                    high = WAKE_DIST_CAP_MM;
+                if (high <= WAKE_DIST_MIN_MM)
+                    want_dist = false; // window collapsed: bg too close
+            }
         }
         thr[i].zone_num = i;
         thr[i].mathematic_operation = VL53L5CX_OPERATION_NONE; // combiners are 4x4-only
@@ -278,7 +312,7 @@ static void build_wake_thresholds(VL53L5CX_DetectionThresholds *thr, int motion_
             thr[i].measurement = VL53L5CX_DISTANCE_MM;
             thr[i].type = VL53L5CX_IN_WINDOW;
             thr[i].param_low_thresh = WAKE_DIST_MIN_MM;
-            thr[i].param_high_thresh = WAKE_DIST_MAX_MM;
+            thr[i].param_high_thresh = high;
         }
         else
         {
@@ -290,6 +324,7 @@ static void build_wake_thresholds(VL53L5CX_DetectionThresholds *thr, int motion_
             thr[i].param_high_thresh = motion_level;
         }
         dist_zone[i] = want_dist;
+        dist_high[i] = high;
     }
     thr[63].zone_num |= VL53L5CX_LAST_THRESHOLD; // mark the final checker
 }
@@ -337,10 +372,10 @@ void app_main(void)
     // Scratch for return codes / flags. The ST driver returns 0 on success.
     uint8_t status, isAlive, isReady;
 
-    fflush(stdout);                                   // Flush any buffered output before we reconfigure UART
-    vTaskDelay(pdMS_TO_TICKS(20));                     // Let pending UART output drain (no driver installed, so
-                                                       //   uart_wait_tx_done can't be used — a short delay suffices)
-    uart_set_baudrate(UART_NUM_0, 921600);            // 921600 baud keeps up with 10+ FPS of 8x8 frames
+    fflush(stdout);                        // Flush any buffered output before we reconfigure UART
+    vTaskDelay(pdMS_TO_TICKS(20));         // Let pending UART output drain (no driver installed, so
+                                           //   uart_wait_tx_done can't be used — a short delay suffices)
+    uart_set_baudrate(UART_NUM_0, 921600); // 921600 baud keeps up with 10+ FPS of 8x8 frames
 
     // Light sleep (ARMED tier) must flush the console UART FIFO before halting,
     // or the last log line is cut off. The console port has no driver, so this
@@ -424,8 +459,14 @@ void app_main(void)
     // checker, for the wake-validation gate.
     static VL53L5CX_DetectionThresholds thresholds[VL53L5CX_NB_THRESHOLDS];
     static bool dist_zone[64];
+    static int dist_high[64];        // per-zone window ceiling (bg - clearance, capped)
+    static uint8_t dist_strikes[64]; // false-wake count per distance zone (demotion)
+    static bool last_wake_zone[64];  // which distance zones triggered the current burst
     memset(thresholds, 0, sizeof(thresholds));
     memset(dist_zone, 0, sizeof(dist_zone));
+    memset(dist_high, 0, sizeof(dist_high));
+    memset(dist_strikes, 0, sizeof(dist_strikes));
+    memset(last_wake_zone, 0, sizeof(last_wake_zone));
 
     // ------------------------------------------------------------------------
     // Step 6: Detector state + two-tier state machine
@@ -572,6 +613,7 @@ void app_main(void)
             // Scanning only dist_zone[] zones keeps hot pixels (motion parity)
             // and bg-in-window zones out of the count by construction.
             int zones_in_window = 0;
+            memset(last_wake_zone, 0, sizeof(last_wake_zone));
             if (isReady)
             {
                 for (int i = 0; i < 64; i++)
@@ -582,8 +624,16 @@ void app_main(void)
                     if (s != 5 && s != 9 && s != 10)
                         continue;
                     int d = Results.distance_mm[i];
-                    if (d >= WAKE_DIST_MIN_MM && d <= WAKE_DIST_MAX_MM)
+                    if (d >= WAKE_DIST_MIN_MM && d <= dist_high[i])
+                    {
+                        last_wake_zone[i] = true;
+                        // STORM DIAGNOSTIC: name the offending zones — which
+                        // cell, what it returned, its per-zone ceiling, status.
+                        if (zones_in_window < 4)
+                            ESP_LOGW(TAG, "  wake zone %d: d=%d (win %d-%d, st %d)",
+                                     i, d, WAKE_DIST_MIN_MM, dist_high[i], s);
                         zones_in_window++;
+                    }
                 }
             }
 
@@ -594,6 +644,8 @@ void app_main(void)
                 // False wake: no aggregate moving AND nothing at person height.
                 // Stay ARMED — the sensor is still ranging autonomously, INT is
                 // now cleared, and the next real trigger will re-fire it.
+                ESP_LOGW(TAG, "Wake rejected (ready=%d, motion %lu/thr %d, 0 zones) — re-armed.",
+                         isReady, (unsigned long)peak_motion, motion_threshold);
                 continue;
             }
 
@@ -696,7 +748,7 @@ void app_main(void)
                 instr_dump("calib"); // empty-doorway reference histogram
 #endif
                 ESP_LOGI(TAG, "Background calibrated (%d frames). Arming.", boot_frames);
-                build_wake_thresholds(thresholds, motion_threshold, &bg, dist_zone);
+                build_wake_thresholds(thresholds, motion_threshold, &bg, dist_strikes, dist_zone, dist_high);
                 int n_dist = 0;
                 for (int i = 0; i < 64; i++)
                     if (dist_zone[i])
@@ -786,7 +838,22 @@ void app_main(void)
                 buffer_event(&fev, flush_us);
                 events_in_burst++;
             }
-            build_wake_thresholds(thresholds, motion_threshold, &bg, dist_zone);
+            // FALSE-WAKE STRIKES: an empty burst (no qualifying blob, no
+            // events) means the wake that started it cried wolf. Strike the
+            // distance zones that triggered it; repeat offenders are demoted
+            // to motion checkers by the rebuild below. A real-but-rejected
+            // crossing (blob >= gate) never strikes.
+            if (events_in_burst == 0 && max_blob < TRK_MIN_BLOB_CELLS)
+            {
+                for (int i = 0; i < 64; i++)
+                {
+                    if (last_wake_zone[i] && dist_strikes[i] < WAKE_ZONE_MAX_STRIKES &&
+                        ++dist_strikes[i] >= WAKE_ZONE_MAX_STRIKES)
+                        ESP_LOGW(TAG, "Zone %d struck out (%d empty-burst wakes) — demoted to motion.",
+                                 i, WAKE_ZONE_MAX_STRIKES);
+                }
+            }
+            build_wake_thresholds(thresholds, motion_threshold, &bg, dist_strikes, dist_zone, dist_high);
             if (sensor_arm_autonomous(&Dev, &motion_config, thresholds))
             {
                 ESP_LOGE(TAG, "Failed to re-arm autonomous mode");
