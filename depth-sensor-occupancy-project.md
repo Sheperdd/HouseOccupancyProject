@@ -1,4 +1,4 @@
-# DIY Depth Sensor Occupancy & Flow Monitoring System — Master Project Prompt
+# DIY Depth Sensor Occupancy & Flow Monitoring System — Master Project Document
 
 ## How to Use This Document
 
@@ -9,47 +9,29 @@ time**.
 
 ### For the Developer
 
-1. **Upload this entire file** as a Project knowledge file in your Claude Project. You don't need to
-   copy-paste sections — Claude sees all Project knowledge automatically in every chat within the
-   project.
-2. **Start a new chat** for each phase. Just say "I'm starting Phase 1. Walk me through it step by
-   step." Claude already has the full document as context.
-3. **For Claude Code tasks:** Use your Project chat as the "architect" — work through design and
-   understanding there first. When you're ready to write code, ask that chat to produce a focused
-   implementation prompt for Claude Code. Claude Code needs tight, concrete coding tasks, not the
-   whole project philosophy. Your Project chat translates between the big picture and the specific
-   implementation.
-4. **After completing each phase,** update the Decisions Log below with key decisions and outcomes.
-   If a major architectural decision changes something in later phases (e.g., switching from ESP32
-   to Pi Zero), ask Claude to rewrite the affected sections and re-upload the updated document as
-   your Project knowledge file.
+1. **This file lives in the repo root** and is the project's single source of truth. Point Claude
+   Code at it when starting a phase (e.g. `@depth-sensor-occupancy-project.md`).
+2. **Work one phase at a time.** Tell Claude Code which phase you're starting; design,
+   implementation, and debugging all happen in the same place.
+3. **After completing each phase,** update the Decisions Log below with key decisions and outcomes.
+   Keep entries tight (decision + why + any gotcha + what's still open); skip detail the code already
+   records. If a decision changes later phases (e.g. switching from ESP32 to Pi Zero), edit the
+   affected sections directly.
 
-### For Claude
+### For Claude Code
 
-- **Always check the Decisions Log before responding.** Entries in the Decisions Log override
-  anything in later phases that contradicts them. If a phase says "ESP32" but the Decisions Log says
-  "switched to Pi Zero in Phase 1," follow the Decisions Log.
+- **Always check the Decisions Log before responding.** Entries there override anything in later
+  phases that contradicts them. If a phase says "ESP32" but the Decisions Log says "switched to Pi
+  Zero in Phase 1," follow the Decisions Log.
 - **Learning is the priority.** Explain concepts thoroughly. Don't skip steps. When there's a
   tradeoff between "easier but you learn less" and "harder but you understand the full picture,"
   lean toward the latter — but flag the tradeoff so the developer can decide.
-- **Every phase should be self-contained enough to hand to a fresh Claude instance.** Always
-  consider the Project Overview and Decisions Log as essential context alongside whichever phase the
-  developer is working on.
-- The developer is strong at programming but new to hardware. Provide step-by-step wiring
+- **Treat the Project Overview and Decisions Log as essential context** for whichever phase is being
+  worked on.
+- **The developer is strong at programming but new to hardware.** Provide step-by-step wiring
   instructions and explain electronics concepts as you go.
-- **Recognize when Claude Code would do this better, and offer to hand off — but ask first.** Claude
-  Code is the right tool when a task is primarily implementation work: multi-file edits, iterating
-  against real compiler or runtime output, installing and configuring libraries or dependencies,
-  scaffolding boilerplate, or any task where being able to read and modify the actual project files
-  (rather than asking the developer to paste them) materially speeds things up. When the developer
-  asks for something that fits cleanly, pause and ask explicitly: _"This looks like a good Claude
-  Code task — want me to write you a focused handoff prompt instead of doing it inline here?"_ Wait
-  for confirmation before producing the handoff message. **Stay inline (don't suggest a handoff)
-  for:** conceptual explanations, architecture and design discussion, code snippets that are part of
-  a learning conversation (the code itself is the lesson), hardware and wiring guidance,
-  step-by-step procedural work the developer follows by hand, and anything where the developer is
-  clearly thinking out loud or making a decision. When in doubt, lean toward staying inline —
-  gratuitous handoffs break the learning flow.
+- **The developer builds and flashes the firmware themselves.** Don't run `pio run` / upload — make
+  the code changes and let them build, flash, and report back.
 
 ---
 
@@ -280,44 +262,103 @@ any contradicting details in the phase descriptions below._
     3. Measure actual power draw with a multimeter (the Phase 6 power-profiling task).
   2026-06-08
 
-- **Phase 2** Power management — ESP32 light sleep implemented at the ARMED tier (implementation done, validation open)
-  Implemented the `TODO(power)` from the previous entry. The ARMED tier now actually halts the ESP32
-  CPU instead of busy-blocking on a FreeRTOS queue.
-  - FIRMWARE (`doorway-node-01/src/main.c`): in the ARMED branch the blocking `xQueueReceive(...,
-    portMAX_DELAY)` was replaced with a light-sleep cycle: `gpio_wakeup_enable(SENSOR_INT_GPIO,
-    GPIO_INTR_LOW_LEVEL)` → `esp_sleep_enable_gpio_wakeup()` → `fflush(stdout)` →
-    `esp_light_sleep_start()` → on wake `gpio_wakeup_disable(SENSOR_INT_GPIO)`. The existing
-    ACK-the-INT + motion-validate gate (check_data_ready/get_ranging_data + peak-aggregate ≥
-    MOTION_THRESHOLD) runs unchanged after wake. The now-unused `event` queue token var was removed;
-    the ISR/queue are left installed (harmless — every path still `xQueueReset()`s).
-  - WHY LIGHT, NOT DEEP (confirmed via ESP-IDF docs `/espressif/esp-idf`): light sleep retains RAM and
-    the internal pull-up on GPIO 4, so the sensor firmware (~80 KB / 2-3 s I2C upload) and the
-    calibrated background survive the sleep. Deep sleep wipes both and would re-upload firmware on
-    every wake, missing the crossing that woke it. Deep sleep stays reserved for long idle windows.
-  - GPIO WAKE IS LEVEL-ONLY: light-sleep GPIO wake doesn't support edge triggers, so we wake on the
-    INT's active-LOW level. Safe because the sensor releases INT high once we read the frame (the ACK),
-    so the next `esp_light_sleep_start()` doesn't trip instantly on a still-low line.
-  - UART GOTCHA (hit + fixed): `uart_wait_tx_done()` requires a `uart_driver_install`'d port; the
-    console UART has none, so it logged `E uart: uart_wait_tx_done(...): uart driver error` every
-    cycle. The supported driver-free way to avoid the sleep truncating a log line is
-    `esp_sleep_set_console_uart_handling_mode(ESP_SLEEP_ALWAYS_FLUSH_UART)` (set once at startup) — then
-    `esp_light_sleep_start()` drains the console TX FIFO itself. Both `uart_wait_tx_done` calls removed
-    (the boot-time one had the same latent bug; replaced with a short `vTaskDelay` before the baud
-    change). `#include "esp_sleep.h"` added.
-  - STILL OPEN (validation, not code):
-    1. MEASURE it — no proof yet that light sleep engages or what current floor it hits. Meter the node;
-       confirm ARMED drops to the hundreds-of-µA CPU range. (Blocked on buying the multimeter; this is
-       the Phase 6 power-profiling task pulled forward.)
-    2. SENSOR is now the power floor — autonomous ranging + I2C pull-ups draw even while the ESP32
-       sleeps; light sleep can't cut that. If the floor is too high, tune ARMED_FREQ_HZ / integration
-       time or revisit pull-up values.
-    3. DEEP SLEEP for long idle (overnight) remains a bigger, separate task: needs `rtc_gpio_pullup_en`
-       on GPIO 4 (internal pull-ups die in deep sleep) + firmware re-upload + background re-seed on wake.
-       Only pursue if light-sleep floor proves insufficient — measurement decides.
-  - UNCHANGED / STILL OPEN from prior entries: the directional clipping bug (wake→capture latency drops
-    short "in"/"out" tracks) is independent of this power work and still open. Detector core untouched;
-    native regression still 0/8/8/4. 2026-06-08
+- **Phase 2** ESP32 light sleep at the ARMED tier (implementation done, validation open)
+  ARMED now halts the CPU instead of busy-blocking a FreeRTOS queue (`gpio_wakeup_enable` LOW_LEVEL +
+  `esp_sleep_enable_gpio_wakeup` + `esp_light_sleep_start`; the existing ACK + motion-validate gate runs
+  unchanged after wake). Light NOT deep (confirmed via ESP-IDF docs): deep sleep wipes RAM + the GPIO 4
+  internal pull-up → would re-upload sensor FW (~80 KB / 2-3 s) and re-seed the background every wake,
+  missing the crossing that woke it; deep sleep stays reserved for long idle. GPIO light-sleep wake is
+  level-only, INT is active-low → wake on LOW; safe because the sensor releases INT high once we read the
+  frame, so the next sleep doesn't trip instantly. GOTCHA: `uart_wait_tx_done()` needs a
+  `uart_driver_install`'d port; the console UART has none → `uart driver error` every cycle. Fix:
+  `esp_sleep_set_console_uart_handling_mode(ESP_SLEEP_ALWAYS_FLUSH_UART)` once at boot lets
+  `esp_light_sleep_start()` drain the TX FIFO itself; both `uart_wait_tx_done` calls removed.
+  OPEN: (1) measure actual draw — no proof it engages yet (blocked on multimeter); (2) the sensor is now
+  the power floor (autonomous ranging + I2C pull-ups draw while the ESP32 sleeps); (3) deep sleep for
+  overnight is a separate task (needs `rtc_gpio_pullup_en` on GPIO 4 + FW re-upload + bg re-seed) — pursue
+  only if the light-sleep floor proves too high. The directional clipping bug (prior entry) is unrelated
+  and still open; detector core untouched, native regression still 0/8/8/4. 2026-06-09
 
+- **Phase 2** Local buffering — NVS-backed store-and-forward ring (implemented; drain waits on Phase 3 MQTT)
+  Phase 2 task 5: a crossing detected while connectivity is down (router/Pi/broker outage) is persisted
+  and replayed instead of lost, else the backend occupancy count drifts permanently. WHY NVS over a
+  LittleFS append-log: the buffer must survive the very events it covers (reboot/crash/power loss, all of
+  which wipe RAM) so it must be flash-backed; NVS is least-machinery (already initialized, no
+  partition-table edits, wear-levelled + power-loss safe). Trade: NVS is a key/value store faked into a
+  FIFO and tighter on space — fine at our rate (a few crossings/min, short outages). DESIGN: fixed ring
+  (`EVBUF_CAPACITY` 64), monotonic `head`/`tail` u32 in NVS (count = tail − head), event blob under key
+  `e<seq % CAP>`, full → drop oldest, every mutation committed. `evbuf_record_t` is decoupled from the
+  detector's `crossing_event_t` so the on-flash format maps 1:1 to the Phase 3 MQTT JSON; `seq` doubles as
+  the Phase 4 dedup key. Files `src/storage/evbuf.{c,h}` (peek→publish→pop is the Phase 3 drain seam);
+  `main.c` enqueues at both emit sites after the `EVENT` line. Native gcc regression unaffected (evbuf not
+  in that build) — still 0/8/8/4. TEST w/o MQTT: walk → reset ESP32 (keeps NVS) → boot log shows N>0
+  pending = cross-reboot persistence proven; `erase_flash` clears it. OPEN: (a) `t_us` is boot-relative
+  µs, real ISO8601 needs Phase 4 NTP (stamp at publish); (b) `node_id` hardcoded, MQTT-configurable in
+  Phase 3; (c) drain-to-MQTT loop is Phase 3. 2026-06-09
+
+
+- **Phase 3** MQTT layer complete — broker, node client, store-and-forward drain, LWT, remote config (all success criteria tested)
+  Mosquitto 2.x on the Pi 5 (`/etc/mosquitto/conf.d/local.conf`): `listener 1883 0.0.0.0` (default
+  binds localhost only — ESP32 can't reach it), `allow_anonymous false`, per-client passwords
+  (`doorway-node-01`, `backend`). GOTCHA: broker exits status 13 if `/etc/mosquitto/passwd` isn't
+  readable by the `mosquitto` user — `chown mosquitto:` + `chmod 600`. Topics:
+  `home/doorways/<node_id>/{events,status,config}` — events QoS1 non-retained (must arrive, must
+  not replay to new subscribers), status+config retained (late subscriber instantly sees last
+  state/config). LWT publishes retained `{"online":false}` to status; node overwrites on connect.
+  - Firmware: new `src/net/` module. THREADING CONTRACT: esp-mqtt runs its own task; its handlers
+    only set word-sized flags — ALL evbuf access stays in the main task via `net_drain_step()` /
+    `net_heartbeat_step()` called from the ARMED 1s idle tick (evbuf is single-writer by design).
+    Drain is peek → publish QoS1 → wait PUBACK → pop: an event leaves flash only after broker ack;
+    PUBACK timeout (10s) re-peeks the same event, so worst case is a duplicate (seq = Phase 4 dedup
+    key), never a loss. One event in flight at a time keeps ordering. Heartbeat 30s retained
+    (uptime, heap, evbuf pending, RSSI). Remote config arrives on the retained config topic, parsed
+    lazily in the main task (cJSON); `motion_threshold` applied at next re-arm — proven live, and
+    survives node reboot via retention. Credentials in `src/net/secrets.h` (gitignored;
+    `secrets.h.example` committed).
+  - DECISION — light sleep compiled out for Phase 3 (`POWER_LIGHT_SLEEP=0` in main.c):
+    `esp_light_sleep_start()` powers down the radio → MQTT session drops every ARMED entry → no
+    heartbeats/LWT/config while armed. ARMED now blocks on the ISR queue with a 1s timeout that
+    services MQTT. WiFi modem-sleep (`WIFI_PS_MIN_MODEM`) is the interim power posture. Sleep code
+    kept behind the flag; reconciling CPU sleep with a live connection (auto light sleep/tickless
+    idle vs wake-then-connect) is the Phase 6 power deep-dive.
+  - TOOLCHAIN GOTCHA — PlatformIO now ships ESP-IDF 6.0, which evicted esp-mqtt and cJSON from
+    core into the Component Registry: add `espressif/mqtt` + `espressif/cjson` to
+    `src/idf_component.yml` (headers/APIs unchanged). Also: PlatformIO's `src` component is NOT
+    `main`, so core components like esp_wifi need explicit `PRIV_REQUIRES` in `src/CMakeLists.txt`.
+  - FLASH/RAM: WiFi+lwIP+MQTT pushed the binary to ~96% of the default 1MB app partition → custom
+    `partitions.csv` (single ~1.9MB factory app; this module is 2MB flash, pinned via
+    `CONFIG_ESPTOOLPY_FLASHSIZE_2MB`). OTA needs the app to fit twice — does NOT fit on 2MB at
+    current size; revisit (trim or 4MB module) when OTA matters (Phase 6+). Main-task stack
+    7168 → 12288 (`esp_wifi_init`/`start` overflowed it — same failure mode as the Phase 1
+    vl53l5cx_init overflow). Remember: sdkconfig.defaults changes need `sdkconfig.esp32dev`
+    deleted to take effect.
+  - VERIFIED: events arrive at broker; broker stopped → 3 crossings buffered to NVS → broker
+    restarted → drained in order, `pending` 3→0; USB pulled → LWT `online:false` within ~45s
+    (1.5× keepalive 30s); retained config picked up after node reboot; anonymous publish refused.
+    Old buffered events from pre-MQTT runs drained on first connect (their `t_us` is boot-relative
+    per run — meaningless until Phase 4 NTP; backend should stamp arrival time meanwhile).
+  - OPEN: (a) `t_us` boot-relative → Phase 4 NTP; (b) `in_axis` promised as MQTT config, not yet
+    wired (only `motion_threshold` is); (c) TLS skipped (plain auth on trusted LAN) — optional
+    learning exercise later; (d) registration is just the retained status message, no separate
+    registry handshake; (e) heartbeat lacks battery level (no battery hardware yet).
+  2026-06-09
+
+- **Phase 3.5** Detection-logic review — `detection-review.md` (critique only, no code changed)
+  Full critical review of background/tracker/wake-tier against the ULD source + UM2884. Headlines:
+  status 255 = "no target detected" yet sits in VALID_STATUS (latent bug, possibly load-bearing
+  for IR-absorbing targets — instrument before changing); 100-frame force-close can double-count
+  a slow crossing (fix: O(1) endpoint tracking, no cap); open directional-clipping bug has two
+  cheap untried fixes (feed the already-read wake frame to the detector; wake on DISTANCE
+  IN_WINDOW checker OR'd with motion); persistent scene change (furniture) corrupts the detector
+  with no recovery (needs absorption timeout). Prioritized plan in section E — items 1-3 don't
+  touch the validated goldens. Fixes to be implemented from that doc as their own change-sets.
+  2026-06-09
+
+- **Phase 3.5** Review items E1–E3 implemented (instrumentation, wake-frame backfill, distance-window wake) — main.c only, detector core untouched, regression 0/8/8/4
+  - E1 instrumentation (`INSTRUMENT_STATUS 1`, compile-out flag): per-frame `SIG,<t_us>,<min_kcps>,<min_cell>,<n255>` line (weakest signal_per_spad among target-seeing cells, /2048 = kcps) + per-cell status histogram (`STATHIST` lines, buckets 5/9/10/255/other) dumped after calibration ("calib" = empty reference) and each burst ("burst" = crossing). Wake frames are instrumented too — answers the review's "are 10ms-integration autonomous frames noisier?" caveat. This data gates items E4–E5 (status-255 semantics).
+  - E2 backfill: the wake-ACK frame (previously discarded) now runs through bg_process→blob→tracker_update before the mode switch; its blob seeds the burst's `max_blob` diagnostic. Track starts 1 frame earlier + grace frames bridge the switch gap.
+  - E3 distance wake — CONSTRAINT FOUND: sensor takes max 64 checkers and AND/OR combiners are 4×4-only, so motion-OR-distance per zone is impossible at 8×8. Solution: checkerboard split — even-parity zones get `DISTANCE_MM`/`IN_WINDOW` (500–1900mm), odd keep motion (hot pixels 1, 5 land on motion parity for free); the OR happens spatially since a person spans 20+ cells. GUARD: a zone whose calibrated bg sits within ±100mm of the window falls back to motion (a static in-window return would assert INT forever → node never idles); checker array rebuilt from live bg at every arm. Wake-validation gate widened to motion≥thr OR ≥1 distance zone in window (distance wakes have no accumulated motion — old gate would have dropped them). Wake log now prints both signals for latency comparison.
+  - OPEN: flash + walk captures (light/dark clothing) to (a) confirm "out" clipping closed, (b) collect the E1 data; E4–E5 wait on that review. If distance zones INT-storm on some mount, tighten WAKE_DIST_MIN/MAX. 2026-06-09
 
 ---
 

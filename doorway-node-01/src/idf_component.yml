@@ -1,4 +1,8 @@
 dependencies:
   rjrp44/vl53l5cx: "^4.0.1"
+  # IDF 6.0 moved esp-mqtt and cJSON out of the core into the registry;
+  # same headers (mqtt_client.h / cJSON.h), just managed dependencies now.
+  espressif/mqtt: "^1.0.0"
+  espressif/cjson: "^1.7.19"
   idf:
     version: ">=5.4"

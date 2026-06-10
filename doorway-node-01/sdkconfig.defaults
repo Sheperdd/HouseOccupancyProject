@@ -1,4 +1,11 @@
-# VL53L5CX firmware upload (~84KB over I2C) needs a larger app_main stack.
-# Default 3584 overflows during vl53l5cx_init.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=7168
+# app_main stack: default 3584 overflowed during vl53l5cx_init (~84KB firmware
+# upload over I2C) -> 7168; that overflowed again at Phase 3 WiFi bring-up
+# (esp_wifi_init/start are stack-hungry) -> 12288. STATS line reports the high
+# water mark; trim later if it shows big margin.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+
+# This module has 2MB flash (not the esp32dev board default of 4MB). Keeps the
+# bootloader's size check honest and esptool from assuming space we don't have.
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+

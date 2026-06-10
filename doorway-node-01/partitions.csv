@@ -1,0 +1,13 @@
+# Custom partition table -- 2MB flash, single ~1.9MB app.
+# WHY: the default table caps the app at 1MB; WiFi+MQTT (Phase 3) pushed the
+# binary to ~96% of that. This gives the app everything after nvs/phy:
+# 0x10000 + 0x1F0000 = 0x200000 = exactly 2MB.
+# NOTE: nvs holds the evbuf store-and-forward ring + WiFi calibration.
+# Re-flashing a new partition table erases it (buffered events lost -- fine).
+# OTA (future expansion) needs two app slots; a ~960KB binary will NOT fit
+# twice in 2MB with margin -- OTA on this board likely means trimming the
+# build or a bigger-flash module. Revisit then.
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x6000
+phy_init, data, phy,     0xf000,  0x1000
+factory,  app,  factory, 0x10000, 0x1F0000

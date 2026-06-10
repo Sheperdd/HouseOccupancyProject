@@ -1,3 +1,6 @@
+# Credentials — never commit (copy src/net/secrets.h.example to secrets.h)
+src/net/secrets.h
+
 # PlatformIO build directories
 .pio/
 .pioenvs/

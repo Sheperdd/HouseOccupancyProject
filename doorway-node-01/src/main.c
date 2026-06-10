@@ -24,6 +24,7 @@
 // ============================================================================
 
 #include <stdio.h>                                // printf() — standard C console output
+#include <stdint.h>                               // UINT32_MAX — instrumentation min-signal scan
 #include <string.h>                               // memset() — zero the thresholds array
 #include "freertos/FreeRTOS.h"                    // Core FreeRTOS types (tick counts, etc.)
 #include "freertos/task.h"                        // vTaskDelay() — sleep without blocking other tasks
@@ -40,10 +41,17 @@
 #include "driver/uart.h"                          // For UART configuration
 #include "driver/gpio.h"                          // GPIO read/config — for the sensor INT pin
 #include "detection/tracker.h"                    // Phase 2 detector port (pure C; pulls in background.h)
+#include "storage/evbuf.h"                        // Phase 2 store-and-forward buffer (NVS-backed)
+#include "net/net.h"                              // Phase 3 WiFi + MQTT client
 
 // "Tag" used by the logging system. Every ESP_LOGI/ESP_LOGE line gets
 // prefixed with this so you can filter logs by subsystem in the serial monitor.
 static const char *TAG = "vl53l5cx";
+
+// Per-node identity. Hardcoded for now; becomes MQTT-configurable in Phase 3.
+// Flows into the buffered event / MQTT payload so the backend can attribute a
+// crossing to a doorway.
+#define NODE_ID "doorway-node-01"
 
 // ----------------------------------------------------------------------------
 // Hardware wiring configuration
@@ -64,6 +72,17 @@ static const char *TAG = "vl53l5cx";
 // I2C bus speed in Hertz. 400 kHz ("fast mode") is the sweet spot.
 #define SENSOR_I2C_FREQ 400000
 
+// ---- power posture ----------------------------------------------------------
+// CONFLICT (Phase 3): esp_light_sleep_start() powers the WiFi radio down, which
+// drops the MQTT session every time we arm -- no heartbeats, no LWT semantics,
+// no remote config while armed. Phase 3 needs a LIVE connection, so light sleep
+// is compiled out (0) and ARMED blocks on the ISR queue instead, waking once a
+// second to service MQTT. WiFi modem-sleep (set in net.c) still naps the radio
+// between AP beacons. Reconciling real CPU sleep with a live connection
+// (auto light sleep / tickless idle, or wake-then-connect) is the Phase 6
+// power deep-dive; set to 1 to get the Phase 2 sleep behavior back.
+#define POWER_LIGHT_SLEEP 0
+
 // ---- two-tier mode parameters ---------------------------------------------
 #define VL53L5CX_THRESHOLD_EVENT 1 // token the ISR pushes into the queue
 #define MOTION_THRESHOLD 60        // motion-indicator level that counts as movement
@@ -76,6 +95,82 @@ static const char *TAG = "vl53l5cx";
 #define ARMED_INTEGRATION_MS 10    // integration time in autonomous mode
 #define CAPTURE_IDLE_FRAMES 30     // re-arm after this many consecutive clear frames (~3s @10Hz)
 #define CAPTURE_MAX_FRAMES 300     // safety cap on one capture burst (~30s @10Hz)
+
+// ---- status/signal instrumentation (detection-review.md item E1) -----------
+// Data-gathering mode to decide the status-255 semantics question (review A1)
+// and the dark-clothing / signal-floor question (review D4) from real captures
+// instead of argument. Two outputs on the serial line:
+//   SIG,<t_us>,<min_kcps>,<min_cell>,<n_status255>   one per processed frame:
+//       weakest per-SPAD return signal among cells that DID see a target
+//       (kcps, fixed-point /2048), which cell it was, and how many cells
+//       reported status 255 ("no target") this frame.
+//   STATHIST,<label>,<status>,<frames>,<c0..c63>     dumped per phase (label
+//       "calib" after bootstrap, "burst" after each capture burst), one line
+//       per status bucket {5,9,10,255,other}: per-cell hit counts.
+// Set to 0 to compile all of it out once the captures are taken.
+#define INSTRUMENT_STATUS 1
+
+#if INSTRUMENT_STATUS
+#define N_STAT_BUCKETS 5 // statuses 5, 9, 10, 255, other
+static const char *STAT_BUCKET_NAME[N_STAT_BUCKETS] = {"5", "9", "10", "255", "other"};
+static uint16_t stat_hist[N_STAT_BUCKETS][64]; // u16: bursts cap at 300 frames
+static uint32_t stat_hist_frames = 0;
+
+static int stat_bucket(uint8_t s)
+{
+    switch (s)
+    {
+    case 5:   return 0;
+    case 9:   return 1;
+    case 10:  return 2;
+    case 255: return 3;
+    default:  return 4;
+    }
+}
+
+// Accumulate one frame into the histogram and emit its SIG line.
+static void instr_add_frame(const VL53L5CX_ResultsData *r, int64_t t_us)
+{
+    uint32_t min_sig = UINT32_MAX;
+    int min_cell = -1;
+    int n255 = 0;
+    for (int i = 0; i < 64; i++)
+    {
+        uint8_t s = r->target_status[i];
+        stat_hist[stat_bucket(s)][i]++;
+        if (s == 255)
+        {
+            n255++; // no target: signal_per_spad is meaningless here
+            continue;
+        }
+        if (r->signal_per_spad[i] < min_sig)
+        {
+            min_sig = r->signal_per_spad[i];
+            min_cell = i;
+        }
+    }
+    stat_hist_frames++;
+    // signal_per_spad is fixed-point kcps/SPAD; /2048 gives integer kcps
+    // (same scaling ST's examples print).
+    printf("SIG,%lld,%lu,%d,%d\n", t_us,
+           min_cell >= 0 ? (unsigned long)(min_sig / 2048u) : 0ul, min_cell, n255);
+}
+
+// Dump and reset the per-cell histogram (called at phase boundaries).
+static void instr_dump(const char *label)
+{
+    for (int b = 0; b < N_STAT_BUCKETS; b++)
+    {
+        printf("STATHIST,%s,%s,%lu", label, STAT_BUCKET_NAME[b],
+               (unsigned long)stat_hist_frames);
+        for (int i = 0; i < 64; i++)
+            printf(",%u", stat_hist[b][i]);
+        printf("\n");
+    }
+    memset(stat_hist, 0, sizeof(stat_hist));
+    stat_hist_frames = 0;
+}
+#endif // INSTRUMENT_STATUS
 
 // Node operating tiers (see file header).
 typedef enum
@@ -135,6 +230,70 @@ static uint8_t sensor_arm_autonomous(VL53L5CX_Configuration *Dev,
     return s;
 }
 
+// ---- wake checkers: distance-window OR'd-across-the-grid with motion -------
+// (detection-review.md item E3 / C3+D1.) The motion indicator needs 1-2
+// autonomous frames of frame-to-frame variation before it trips INT — that
+// accumulation is the biggest chunk of the wake latency clipping "out"
+// crossings. A DISTANCE_MM checker with IN_WINDOW fires the FIRST frame any
+// zone sees a return at person height: no accumulation at all.
+//
+// CONSTRAINT: the sensor takes at most 64 checkers total (one per zone at 8x8)
+// and the AND/OR combiners are 4x4-only — so we cannot put BOTH checkers on
+// every zone. Instead the grid is split checkerboard-style: half the zones get
+// the distance checker, half keep motion. A person's blob spans 20+ cells at
+// peak (Phase 1), so either checker type sees them — the OR happens spatially.
+// Conveniently, hot pixels 1 and 5 land on the motion side of this parity.
+#define WAKE_DIST_MIN_MM 500  // person-height return window (review C3): below
+#define WAKE_DIST_MAX_MM 1900 //   = too close (noise), above = floor/background
+#define WAKE_BG_MARGIN_MM 100 // keep-out margin around the window vs calibrated bg
+
+// (Re)build the 64-checker array before each arm. Motion zones get the current
+// trip level (MQTT-configurable, review's set_motion_threshold role). Distance
+// zones get the IN_WINDOW checker — UNLESS that zone's calibrated background
+// already sits in/near the window (doorframe edge, furniture): a static return
+// inside the window would assert INT permanently and the node would never
+// idle, so those zones fall back to motion. dist_zone[] records the final
+// assignment for the wake-validation gate. Rebuilt at every arm, so it tracks
+// the EMA-drifting background for free.
+static void build_wake_thresholds(VL53L5CX_DetectionThresholds *thr, int motion_level,
+                                  const background_model_t *bg, bool dist_zone[64])
+{
+    memset(thr, 0, VL53L5CX_NB_THRESHOLDS * sizeof(*thr));
+    for (int i = 0; i < 64; i++)
+    {
+        int row = i / 8, col = i % 8;
+        bool want_dist = ((row + col) % 2) == 0;
+        if (want_dist)
+        {
+            if (!bg->calibrated[i])
+                want_dist = false; // unknown background: motion is the safe checker
+            else if (bg->bg[i] > (float)(WAKE_DIST_MIN_MM - WAKE_BG_MARGIN_MM) &&
+                     bg->bg[i] < (float)(WAKE_DIST_MAX_MM + WAKE_BG_MARGIN_MM))
+                want_dist = false; // static scene inside the window: would INT-storm
+        }
+        thr[i].zone_num = i;
+        thr[i].mathematic_operation = VL53L5CX_OPERATION_NONE; // combiners are 4x4-only
+        if (want_dist)
+        {
+            thr[i].measurement = VL53L5CX_DISTANCE_MM;
+            thr[i].type = VL53L5CX_IN_WINDOW;
+            thr[i].param_low_thresh = WAKE_DIST_MIN_MM;
+            thr[i].param_high_thresh = WAKE_DIST_MAX_MM;
+        }
+        else
+        {
+            thr[i].measurement = VL53L5CX_MOTION_INDICATOR;
+            thr[i].type = VL53L5CX_GREATER_THAN_MAX_CHECKER;
+            // GREATER_THAN_MAX: low/high set equal to avoid ambiguity over
+            // which field the checker reads (ST's example does the same).
+            thr[i].param_low_thresh = motion_level;
+            thr[i].param_high_thresh = motion_level;
+        }
+        dist_zone[i] = want_dist;
+    }
+    thr[63].zone_num |= VL53L5CX_LAST_THRESHOLD; // mark the final checker
+}
+
 // Emit a crossing event on the serial line.
 //   EVENT,<esp_timer_us>,<direction>,<net>,<confidence>,<peak_blob>
 static void emit_event(const crossing_event_t *e, int64_t t_us)
@@ -144,6 +303,22 @@ static void emit_event(const crossing_event_t *e, int64_t t_us)
                                                   : "none";
     printf("EVENT,%lld,%s,%.3f,%.3f,%d\n",
            t_us, dir, e->net, e->confidence, e->peak_blob);
+}
+
+// Persist a crossing to the store-and-forward buffer so it survives a reboot /
+// connectivity outage until the Phase 3 MQTT client drains it. Maps the
+// detector's event onto the compact on-flash record. t_us is the esp_timer
+// timestamp at detection (boot-relative until Phase 4 NTP stamps wall-clock).
+static void buffer_event(const crossing_event_t *e, int64_t t_us)
+{
+    evbuf_record_t r = {
+        .t_us = t_us,
+        .direction = (e->direction == DIR_IN) ? 1 : 0,
+        .net = e->net,
+        .confidence = e->confidence,
+        .peak_blob = (uint16_t)e->peak_blob,
+    };
+    evbuf_enqueue(&r);
 }
 
 // app_main() is the entry point on ESP-IDF — equivalent to main() on a PC.
@@ -241,22 +416,16 @@ void app_main(void)
     gpio_install_isr_service(0);
     gpio_isr_handler_add(SENSOR_INT_GPIO, vl53l5cx_isr_handler, (void *)VL53L5CX_THRESHOLD_EVENT);
 
-    // Detection thresholds: trip the INT when ANY zone's motion indicator
-    // exceeds MOTION_THRESHOLD. static => kept off app_main's stack.
+    // Detection thresholds: trip the INT when a motion zone's indicator exceeds
+    // the trip level OR a distance zone sees a person-height return. The array
+    // is (re)built by build_wake_thresholds() before every arm — it needs the
+    // calibrated background, which doesn't exist yet here. static => kept off
+    // app_main's stack. dist_zone[] mirrors which zones carry the distance
+    // checker, for the wake-validation gate.
     static VL53L5CX_DetectionThresholds thresholds[VL53L5CX_NB_THRESHOLDS];
+    static bool dist_zone[64];
     memset(thresholds, 0, sizeof(thresholds));
-    for (int i = 0; i < 64; i++)
-    {
-        thresholds[i].zone_num = i;
-        thresholds[i].measurement = VL53L5CX_MOTION_INDICATOR;
-        thresholds[i].type = VL53L5CX_GREATER_THAN_MAX_CHECKER;
-        thresholds[i].mathematic_operation = VL53L5CX_OPERATION_NONE; // 4x4 only
-        // GREATER_THAN_MAX: set low/high equal to avoid ambiguity over which
-        // field the checker reads (ST's example uses 44 as "this is movement").
-        thresholds[i].param_low_thresh = MOTION_THRESHOLD;
-        thresholds[i].param_high_thresh = MOTION_THRESHOLD;
-    }
-    thresholds[63].zone_num |= VL53L5CX_LAST_THRESHOLD; // mark the final checker
+    memset(dist_zone, 0, sizeof(dist_zone));
 
     // ------------------------------------------------------------------------
     // Step 6: Detector state + two-tier state machine
@@ -268,6 +437,22 @@ void app_main(void)
     bg_init(&bg);
     tracker_init(&tk);
     int boot_frames = 0;
+
+    // Store-and-forward buffer. Persisted in NVS, so any crossings left unsent
+    // from a previous run (power loss / WiFi outage) are still here on boot and
+    // will be drained once the Phase 3 MQTT client exists.
+    evbuf_init();
+    ESP_LOGI(TAG, "Node %s — %u buffered event(s) pending forward.",
+             NODE_ID, (unsigned)evbuf_count());
+
+    // Phase 3: bring up WiFi + MQTT in the background (must follow evbuf_init —
+    // WiFi needs NVS). Anything already buffered (including events from before
+    // this boot) drains via net_drain_step() once the broker session is up.
+    net_init(NODE_ID);
+
+    // Current motion-threshold trip level; MQTT config can change it, applied
+    // at the next (re-)arm.
+    int motion_threshold = MOTION_THRESHOLD;
 
     node_state_t state = STATE_CALIBRATING;
     int empty_streak = 0;    // consecutive clear frames during a capture burst
@@ -296,6 +481,7 @@ void app_main(void)
         // -------------------- ARMED: low-power wait for motion --------------
         if (state == STATE_ARMED)
         {
+#if POWER_LIGHT_SLEEP
             // LIGHT SLEEP until the sensor's INT pulls the line LOW. The ESP32
             // halts its CPU (drops from ~mA to hundreds of uA) while the sensor
             // keeps ranging autonomously on its own. Light, NOT deep: deep sleep
@@ -323,6 +509,29 @@ void app_main(void)
             // edge ISR may push a token while INT is still low here; harmless --
             // the xQueueReset() below clears it.
             gpio_wakeup_disable(SENSOR_INT_GPIO);
+#else
+            // Phase 3 posture: BLOCK on the ISR queue instead of sleeping, so
+            // WiFi/MQTT stays alive while armed. The 1 s timeout is the MQTT
+            // service tick: drain one buffered event toward the broker, send
+            // the heartbeat if due, and pick up any pushed config. The CPU
+            // still idles in the blocked wait — just no radio-killing sleep.
+            uint32_t evt;
+            if (xQueueReceive(vl53l5cx_queue, &evt, pdMS_TO_TICKS(1000)) == pdFALSE)
+            {
+                net_drain_step();
+                net_heartbeat_step();
+                int mt = net_motion_threshold(MOTION_THRESHOLD);
+                if (mt != motion_threshold)
+                {
+                    // Applied at the NEXT arm — build_wake_thresholds() reads
+                    // this level when it rebuilds the checker array. Good
+                    // enough: re-arm happens after every burst.
+                    motion_threshold = mt;
+                    ESP_LOGI(TAG, "motion_threshold -> %d (applies on next arm)", mt);
+                }
+                continue; // nothing moved; keep waiting
+            }
+#endif
 
             // ACK the wake at the sensor. ST's ULD requires check_data_ready +
             // get_ranging_data to clear the data-ready status that the INT line
@@ -357,16 +566,70 @@ void app_main(void)
                 if (Results.motion_indicator.motion[i] > peak_motion)
                     peak_motion = Results.motion_indicator.motion[i];
 
+            // Distance-checker evidence: how many distance zones see a return
+            // inside the wake window right now? Statuses 5/9/10 only — 255
+            // means "no target", its distance field is garbage (review A1).
+            // Scanning only dist_zone[] zones keeps hot pixels (motion parity)
+            // and bg-in-window zones out of the count by construction.
+            int zones_in_window = 0;
+            if (isReady)
+            {
+                for (int i = 0; i < 64; i++)
+                {
+                    if (!dist_zone[i])
+                        continue;
+                    uint8_t s = Results.target_status[i];
+                    if (s != 5 && s != 9 && s != 10)
+                        continue;
+                    int d = Results.distance_mm[i];
+                    if (d >= WAKE_DIST_MIN_MM && d <= WAKE_DIST_MAX_MM)
+                        zones_in_window++;
+                }
+            }
+
             xQueueReset(vl53l5cx_queue); // drop arm-transient / queued INT pulses
 
-            if (!isReady || peak_motion < MOTION_THRESHOLD)
+            if (!isReady || (peak_motion < (uint32_t)motion_threshold && zones_in_window == 0))
             {
-                // False wake: no aggregate actually moving. Stay ARMED — the
-                // sensor is still ranging autonomously, INT is now cleared, and
-                // the next real motion will re-fire it.
-                // ESP_LOGI(TAG, "Wake ignored: peak motion %lu < %d — re-armed.",
-                //          (unsigned long)peak_motion, MOTION_THRESHOLD);
+                // False wake: no aggregate moving AND nothing at person height.
+                // Stay ARMED — the sensor is still ranging autonomously, INT is
+                // now cleared, and the next real trigger will re-fire it.
                 continue;
+            }
+
+            // BACKFILL (review C2/D2): the ACK frame we just read contains the
+            // person's position AT WAKE — feed it to the detector instead of
+            // throwing it away. The track starts one frame earlier, and the
+            // tracker's grace frames then bridge the mode-switch gap below.
+            // Directly attacks the directional clipping bug: the "out" path
+            // enters the FOV corner the grid sees last, so every recovered
+            // frame extends that direction's observable arc.
+            int wake_blob = 0;
+            {
+                int64_t wake_us = esp_timer_get_time();
+                int dist_w[64], status_w[64];
+                for (int i = 0; i < 64; i++)
+                {
+                    dist_w[i] = Results.distance_mm[i];
+                    status_w[i] = Results.target_status[i];
+                }
+#if INSTRUMENT_STATUS
+                // Wake frames use ARMED_INTEGRATION_MS (10ms) — possibly
+                // noisier than continuous frames. Instrumenting them answers
+                // the review's quality caveat empirically.
+                instr_add_frame(&Results, wake_us);
+#endif
+                bool occ_w[64];
+                float dev_w[64];
+                bg_process(&bg, dist_w, status_w, occ_w, dev_w);
+                int cells_w[64];
+                wake_blob = det_largest_blob(occ_w, cells_w);
+                crossing_event_t wev = tracker_update(&tk, cells_w, wake_blob, dev_w, wake_us);
+                if (wev.valid)
+                {
+                    emit_event(&wev, wake_us);
+                    buffer_event(&wev, wake_us);
+                }
             }
 
             if (sensor_start_continuous(&Dev))
@@ -376,12 +639,15 @@ void app_main(void)
             state = STATE_CAPTURING;
             empty_streak = 0;
             capture_frames = 0;
-            max_blob = 0;
+            max_blob = wake_blob; // the wake frame counts toward burst diagnostics
             events_in_burst = 0;
             last_frame_us = 0;
             last_stats_us = esp_timer_get_time();
-            ESP_LOGI(TAG, "Motion detected (peak %lu) — capturing.",
-                     (unsigned long)peak_motion);
+            // Logs BOTH wake signals so the two paths' latencies can be
+            // compared empirically (review E3): a distance-led wake shows
+            // zones>0 with motion still under the threshold.
+            ESP_LOGI(TAG, "Wake (motion peak %lu/thr %d, %d dist zones in window) — capturing.",
+                     (unsigned long)peak_motion, motion_threshold, zones_in_window);
             continue;
         }
 
@@ -414,6 +680,10 @@ void app_main(void)
             printf(",%d", Results.target_status[i]);
         printf("\n");
 
+#if INSTRUMENT_STATUS
+        instr_add_frame(&Results, after_read);
+#endif
+
         // -------------------- CALIBRATING -----------------------------------
         if (state == STATE_CALIBRATING)
         {
@@ -422,7 +692,16 @@ void app_main(void)
             if (boot_frames >= BG_BOOTSTRAP_FRAMES)
             {
                 bg_bootstrap_finalize(&bg);
+#if INSTRUMENT_STATUS
+                instr_dump("calib"); // empty-doorway reference histogram
+#endif
                 ESP_LOGI(TAG, "Background calibrated (%d frames). Arming.", boot_frames);
+                build_wake_thresholds(thresholds, motion_threshold, &bg, dist_zone);
+                int n_dist = 0;
+                for (int i = 0; i < 64; i++)
+                    if (dist_zone[i])
+                        n_dist++;
+                ESP_LOGI(TAG, "Wake checkers: %d distance-window, %d motion.", n_dist, 64 - n_dist);
                 if (sensor_arm_autonomous(&Dev, &motion_config, thresholds))
                 {
                     ESP_LOGE(TAG, "Failed to arm autonomous mode");
@@ -459,6 +738,7 @@ void app_main(void)
         if (ev.valid)
         {
             emit_event(&ev, after_read);
+            buffer_event(&ev, after_read);
             events_in_burst++;
         }
 
@@ -501,14 +781,20 @@ void app_main(void)
             crossing_event_t fev = tracker_flush(&tk);
             if (fev.valid)
             {
-                emit_event(&fev, esp_timer_get_time());
+                int64_t flush_us = esp_timer_get_time();
+                emit_event(&fev, flush_us);
+                buffer_event(&fev, flush_us);
                 events_in_burst++;
             }
+            build_wake_thresholds(thresholds, motion_threshold, &bg, dist_zone);
             if (sensor_arm_autonomous(&Dev, &motion_config, thresholds))
             {
                 ESP_LOGE(TAG, "Failed to re-arm autonomous mode");
             }
             xQueueReset(vl53l5cx_queue);
+#if INSTRUMENT_STATUS
+            instr_dump("burst"); // crossing histogram (incl. the wake frame)
+#endif
             // DIAGNOSTIC: which capture stage is failing?
             //   frames==0          -> continuous didn't restart (sensor config)
             //   frames>0, blob<4   -> no person blob (background/data problem)
