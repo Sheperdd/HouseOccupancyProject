@@ -380,9 +380,47 @@ any contradicting details in the phase descriptions below._
   bg clearance — mount geometry; node 2's mount is much higher than node 1's). Cap must sit
   clearly under that mount's floor distance or floor noise storms the INT; on a higher mount a
   person's deviation is larger, so clearance can rise for extra storm margin. main.c aliases all
-  three into the old WAKE_* names. Node 2 still needs: broker user (`mosquitto_passwd`), real
-  password in secrets.h, in_axis calibration at mount, hot-pixel map, wake window (MIN/CAP/
-  clearance) from measured floor distance. 2026-06-11
+  three into the old WAKE_* names. 2026-06-11
+
+- **Phase 4** Node 2 fully configured and deployed — both nodes live on the broker
+  Completed node 2 bring-up (Phase 4 task 1): broker user via `mosquitto_passwd`, password in
+  `secrets.h`, and all `node_config_02.h` install constants set from at-mount calibration —
+  `in_axis` ≈ (0.44, −0.898) derived from known-direction walks (fixture
+  `fixtures/node02_walks.*`), hot-pixel map `{0}` (cell (0,0)), wake window MIN 700 / CAP 2200 /
+  clearance 400 mm for this higher mount. Node 1's axis was also re-derived at its current mount
+  ≈ (−0.547, −0.837) from a fresh walks capture (`fixtures/node01_walks.*`) — supersedes the
+  Phase 2 value. GOTCHA: the native-regression goldens are still pinned to the ORIGINAL Phase 2
+  fixture values via the committed `detector/native/node_config.h` — device axes and golden axes
+  now legitimately differ; don't "sync" them. 2026-06-11
+
+- **Phase 4** NTP clock sync implemented and verified (task 2 done)
+  SNTP via `esp_netif_sntp` in `src/net/`: configured at init (`start=false`), started in the
+  got-IP handler (restart on every reconnect = fresh poll after an outage of unknown length);
+  lwIP re-polls hourly. Sync callback runs in the lwIP task → flags only, 32-bit on purpose
+  (ESP32 can't write int64 atomically across tasks — same contract as the MQTT flags).
+  Default IMMED step mode, not smooth: first sync is a ~56-year jump from the 1970 epoch only a
+  step can cover; later hourly corrections are tens of ms, harmless for occupancy.
+  - Events now stamped at DETECTION, not publish: `evbuf_record_t` grew `t_unix_ms` (0 = clock
+    unsynced when the event fired → backend stamps arrival instead) — an event drained hours
+    into an outage still carries when the crossing happened. Closes the long-open "t_us is
+    boot-relative" debt; `t_us` kept for intra-boot ordering/debug. Record size change means
+    pre-upgrade flash records get dropped on first drain (existing peek size-check; no wedge).
+  - Heartbeat gains `t_unix_ms`, `time_synced`, `sync_age_s` (−1 = never synced; many hours =
+    NTP unreachable, clock drifting) — the Phase 4 "sync quality in heartbeat" requirement.
+  - `NTP_SERVER` defaults to pool.ntp.org, overridable in secrets.h (point at chrony on the Pi 5
+    later if internet-down sync matters). `lwip` added to PRIV_REQUIRES (owns esp_netif_sntp.h
+    in IDF 6). FW_VERSION → 0.4.0-phase4.
+  - GOTCHA: `int64_t` in a header without `<stdint.h>` → pre-C99 implicit-int silently declared
+    the function as returning `int`, surfacing as a confusing trio of unknown-type / printf-format
+    / conflicting-types errors. One missing include, three error messages. 2026-06-11
+
+- **Phase 4→5** Plan reorder: ALL of Phase 5 before the rest of Phase 4
+  Phase 4 tasks 3–6 (hallway correlation, event ordering, fault-tolerance display, drift
+  correction) are backend/dashboard code — nothing consumes broker events yet, so there's
+  nowhere for them to live and no real data to debug them against. Doing Phase 5 in full first
+  (backend service + digital twin dashboard), then returning to Phase 4's distributed-systems
+  logic with two live nodes feeding it. Firmware half of Phase 4 (node 2 + NTP) is done.
+  2026-06-11
 
 ---
 

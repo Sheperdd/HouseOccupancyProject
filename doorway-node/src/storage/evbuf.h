@@ -36,12 +36,19 @@
 typedef struct
 {
     uint32_t seq;        /* monotonic id, assigned on enqueue -- the dedup key for Phase 4 */
-    int64_t t_us;        /* esp_timer timestamp at detection (boot-relative until Phase 4 NTP) */
+    int64_t t_us;        /* esp_timer timestamp at detection (boot-relative; intra-boot ordering/debug) */
+    int64_t t_unix_ms;   /* wall-clock at detection (Unix ms, NTP-derived); 0 = clock not yet
+                          * synced when the event fired -> backend stamps arrival time instead.
+                          * Stamped at DETECTION, not publish: a buffered event drained after an
+                          * hour-long outage still carries when the crossing actually happened. */
     uint8_t direction;   /* 0 = out, 1 = in */
     float net;           /* net displacement (cells) */
     float confidence;    /* 0..1 */
     uint16_t peak_blob;  /* peak largest-blob size (cells) */
 } evbuf_record_t;
+/* NOTE: growing this struct changes the on-flash blob size. evbuf_peek()
+ * size-checks and DROPS old-format records (with a log) rather than wedging
+ * the queue -- pre-upgrade buffered events are sacrificed on first drain. */
 
 /* Open NVS + load (or create) head/tail. Idempotent; call once at startup before
  * any other evbuf call. Initializes the NVS flash partition if needed. */

@@ -23,6 +23,7 @@
 #define NET_NET_H
 
 #include <stdbool.h>
+#include <stdint.h> /* int64_t (net_epoch_ms) */
 
 /* Start WiFi + MQTT (non-blocking; connects and reconnects in the background).
  * Call ONCE at startup, AFTER evbuf_init() (NVS must be ready -- WiFi stores
@@ -45,5 +46,15 @@ void net_heartbeat_step(void);
  * if no config has arrived. main.c re-reads this before every re-arm, so a
  * remote change takes effect at the next ARMED cycle -- no reflash. */
 int net_motion_threshold(int fallback);
+
+/* True once SNTP has set the system clock at least once this boot (Phase 4).
+ * The clock keeps running off esp_timer between syncs; lwIP re-polls the NTP
+ * server hourly to bound drift. */
+bool net_time_synced(void);
+
+/* Wall-clock now as Unix milliseconds, or 0 if the clock was never synced
+ * this boot (pre-sync system time starts at the 1970 epoch -- garbage for
+ * timestamping, so callers get an explicit "unknown" instead). */
+int64_t net_epoch_ms(void);
 
 #endif /* NET_NET_H */

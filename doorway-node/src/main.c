@@ -337,12 +337,14 @@ static void emit_event(const crossing_event_t *e, int64_t t_us)
 
 // Persist a crossing to the store-and-forward buffer so it survives a reboot /
 // connectivity outage until the Phase 3 MQTT client drains it. Maps the
-// detector's event onto the compact on-flash record. t_us is the esp_timer
-// timestamp at detection (boot-relative until Phase 4 NTP stamps wall-clock).
+// detector's event onto the compact on-flash record. Wall-clock is stamped
+// HERE (detection), not at publish: an event drained hours later still carries
+// when the crossing happened. 0 = clock not synced yet -> backend stamps arrival.
 static void buffer_event(const crossing_event_t *e, int64_t t_us)
 {
     evbuf_record_t r = {
         .t_us = t_us,
+        .t_unix_ms = net_epoch_ms(),
         .direction = (e->direction == DIR_IN) ? 1 : 0,
         .net = e->net,
         .confidence = e->confidence,

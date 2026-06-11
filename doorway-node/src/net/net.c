@@ -14,12 +14,14 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -31,9 +33,14 @@
 
 static const char *TAG = "net";
 
-#define FW_VERSION "0.3.0-phase3"
+#define FW_VERSION "0.4.0-phase4"
 #define HEARTBEAT_INTERVAL_US (30LL * 1000 * 1000) /* 30 s */
 #define PUBACK_TIMEOUT_US (10LL * 1000 * 1000)     /* give up waiting, republish */
+
+/* NTP server; override in secrets.h if the LAN runs its own (e.g. the Pi 5). */
+#ifndef NTP_SERVER
+#define NTP_SERVER "pool.ntp.org"
+#endif
 
 /* Topic strings, built once from node_id in net_init(). */
 static char s_topic_events[80];
@@ -61,6 +68,28 @@ static int s_motion_threshold = -1; /* parsed value; -1 = nothing received yet *
 
 static int64_t s_last_heartbeat_us = 0;
 
+/* ---- SNTP state (written by the lwIP task's sync callback) ----------------
+ * Both fields are 32-bit on purpose: the ESP32 can't write an int64 atomically,
+ * and these are crossed between the lwIP task and the main task (same rule as
+ * the MQTT flags above). Seconds resolution is plenty for "sync age". */
+static volatile bool s_time_synced = false;
+static volatile uint32_t s_last_sync_uptime_s = 0;
+
+/* ---------------------------------------------------------------------------
+ * SNTP: runs in the lwIP task -- flags only here, same contract as MQTT.
+ * Fires on every (re)sync: lwIP re-polls hourly (CONFIG_LWIP_SNTP_UPDATE_DELAY)
+ * to bound crystal drift (~tens of ppm => tens of ms/hour). Sync mode is the
+ * default IMMED (settimeofday step): the first sync is a ~56-year jump from
+ * the 1970 epoch that only a step can cover, and later corrections are small
+ * enough that a step is harmless for occupancy timestamps.
+ * ------------------------------------------------------------------------- */
+static void time_sync_cb(struct timeval *tv)
+{
+    s_last_sync_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    s_time_synced = true;
+    ESP_LOGI(TAG, "Time synced: %lld (unix s)", (long long)tv->tv_sec);
+}
+
 /* ---------------------------------------------------------------------------
  * WiFi: join as a station, reconnect forever on drop.
  * ------------------------------------------------------------------------- */
@@ -83,6 +112,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+        // (Re)start SNTP now that DNS + routing exist. Safe to call on every
+        // reconnect -- a restart just triggers a fresh poll, which is exactly
+        // what we want after an outage of unknown length.
+        esp_netif_sntp_start();
         // Start the MQTT client on the FIRST IP only; after that it manages
         // its own reconnects.
         static bool mqtt_started = false;
@@ -194,6 +227,16 @@ void net_init(const char *node_id)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // --- SNTP (configured now, started when WiFi gets an IP) ---
+    // start = false: starting before the netif has an IP would just burn DNS
+    // lookups against a dead interface; the got-IP handler starts it.
+    {
+        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(NTP_SERVER);
+        sntp_cfg.start = false;
+        sntp_cfg.sync_cb = time_sync_cb;
+        ESP_ERROR_CHECK(esp_netif_sntp_init(&sntp_cfg));
+    }
+
     // --- MQTT client (created now, started when WiFi gets an IP) ---
     // LWT: if this node dies without a clean DISCONNECT (power pulled, crash,
     // out of WiFi range), the BROKER publishes this on our behalf. Retained,
@@ -255,16 +298,17 @@ void net_drain_step(void)
     if (!evbuf_peek(&r))
         return; // nothing buffered
 
-    // The Phase 2 doc's event shape, plus seq. t_us is boot-relative until
-    // Phase 4 NTP gives us wall-clock; the backend can timestamp on arrival
-    // meanwhile.
-    char json[224];
+    // The Phase 2 doc's event shape, plus seq. t_unix_ms is the wall-clock at
+    // DETECTION (0 = clock wasn't synced when the event fired -- backend
+    // stamps arrival time for those); t_us stays boot-relative for intra-boot
+    // ordering and debugging.
+    char json[256];
     snprintf(json, sizeof json,
              "{\"node_id\":\"%s\",\"seq\":%u,\"event\":\"crossing\","
-             "\"direction\":\"%s\",\"t_us\":%lld,\"net\":%.3f,"
-             "\"confidence\":%.3f,\"peak_blob\":%u}",
+             "\"direction\":\"%s\",\"t_unix_ms\":%lld,\"t_us\":%lld,"
+             "\"net\":%.3f,\"confidence\":%.3f,\"peak_blob\":%u}",
              s_node_id, (unsigned)r.seq, r.direction ? "in" : "out",
-             r.t_us, r.net, r.confidence, (unsigned)r.peak_blob);
+             r.t_unix_ms, r.t_us, r.net, r.confidence, (unsigned)r.peak_blob);
 
     s_inflight_acked = false;
     int msg_id = esp_mqtt_client_publish(s_client, s_topic_events, json, 0, 1, 0);
@@ -288,15 +332,39 @@ void net_heartbeat_step(void)
     wifi_ap_record_t ap;
     int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
 
+    // Sync quality for the backend/dashboard (Phase 4): synced at all, and how
+    // stale. age grows ~1 hr between lwIP re-polls; an age of many hours means
+    // the NTP server is unreachable and this node's timestamps are drifting.
+    bool synced = s_time_synced;
+    long sync_age_s = synced
+                          ? (long)((uint32_t)(now / 1000000) - s_last_sync_uptime_s)
+                          : -1;
+
     // Retained: a dashboard connecting at any moment gets the latest health
     // snapshot instantly instead of waiting up to 30 s for the next beat.
-    char msg[224];
+    char msg[288];
     snprintf(msg, sizeof msg,
              "{\"node_id\":\"%s\",\"online\":true,\"fw\":\"%s\","
-             "\"uptime_s\":%lld,\"heap_free\":%u,\"pending\":%u,\"rssi\":%d}",
+             "\"uptime_s\":%lld,\"heap_free\":%u,\"pending\":%u,\"rssi\":%d,"
+             "\"t_unix_ms\":%lld,\"time_synced\":%s,\"sync_age_s\":%ld}",
              s_node_id, FW_VERSION, now / 1000000,
-             (unsigned)esp_get_free_heap_size(), (unsigned)evbuf_count(), rssi);
+             (unsigned)esp_get_free_heap_size(), (unsigned)evbuf_count(), rssi,
+             net_epoch_ms(), synced ? "true" : "false", sync_age_s);
     esp_mqtt_client_publish(s_client, s_topic_status, msg, 0, 1, 1);
+}
+
+bool net_time_synced(void)
+{
+    return s_time_synced;
+}
+
+int64_t net_epoch_ms(void)
+{
+    if (!s_time_synced)
+        return 0; // pre-sync system time is the 1970 epoch -- worse than nothing
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
 int net_motion_threshold(int fallback)
