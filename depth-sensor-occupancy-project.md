@@ -360,6 +360,30 @@ any contradicting details in the phase descriptions below._
   - E3 distance wake — CONSTRAINT FOUND: sensor takes max 64 checkers and AND/OR combiners are 4×4-only, so motion-OR-distance per zone is impossible at 8×8. Solution: checkerboard split — even-parity zones get `DISTANCE_MM`/`IN_WINDOW`, odd keep motion (hot pixels 1, 5 land on motion parity for free); the OR happens spatially since a person spans 20+ cells. GOTCHA (hit on first flash): a FIXED window ceiling (1900mm) sat ~100mm under the floor (~2000mm) — floor noise dipped into the window → continuous INT storm. Fix: per-zone ceiling = calibrated bg − clearance, capped at 1900 (hardware bg-subtraction: "return significantly closer than this zone's floor"); window collapsed (bg too close) or uncalibrated → motion fallback. Checker array rebuilt from live bg at every arm. GOTCHA 2: bimodal edge cells defeat clearance math — zone 13 (1,5) flickers a doorframe surface ~320mm closer than its median bg with STATUS 5, so median+MAD never see it; it slipped a 300mm clearance and kept storming. Fix: clearance 300→400 + strike demotion — a distance zone whose wake yields an empty burst (no blob, no events) twice is demoted to a motion checker until reboot (self-healing per mount; generalizes the hand-coded HOT_PIXELS lesson — real crossings never strike because their burst has a blob). Wake-validation gate widened to motion≥thr OR ≥1 distance zone in window (distance wakes have no accumulated motion — old gate would have dropped them). Wake log now prints both signals for latency comparison.
   - CAPTURE RESULTS (capture/{empty,light,dark}.log, analyzed same night): clipping bug CLOSED — light 6/6 events clean alternation, dark 5/6 (one reject net 0.95 < 1.2); distance checker led most wakes (motion peak under 60 at wake). Strike demotion proven live: zones 13 + 4 struck out, node silent after. A1 VERDICT — status 255 is NOT person/dark-correlated: rate flat ~4% across empty/light/dark, concentrated in fixed FOV-corner cells (63, 62, 39 — geometry, not targets); the "255 is load-bearing for dark hair" fear is unsupported at this mount → tri-state fix (item E4) safe to proceed. A2 CONFIRMED — untrusted "other" statuses jump 1.2%→6.5% during crossings on person-path cells: mid-crossing status flicker is real, latch-hold justified; also explains dark's smaller blobs (8–17 vs 15–19 peak). D4 parked: min-over-grid signal_per_spad always 0 kcps (edge cells), and with 255 not dark-correlated there's no driver. SIDE FINDING: corner cells' bootstrap medians include 255-garbage samples (131/150 frames at cell 63) — E4's bootstrap exclusion will fix their bg for free. TUNING (user, on device): TRK_MIN_NET_DISPLACEMENT 1.5→1.2 (tracker.h), CAPTURE_IDLE_FRAMES 30→20; native regression REBUILT (stale-binary gotcha: run_regression.py doesn't compile — make first or PASS is against the old binary) and passes 0/8/8/4 at 1.2. NOTE: Python reference tracker.py still has MIN_NET_DISPLACEMENT=2 — C and Python constants now diverge; sync Python when E4's replay rerun happens anyway. 2026-06-09
 
+- **Phase 4** Firmware tree made node-agnostic — `doorway-node-01/` → `doorway-node/`, per-node constants → committed `node_config_XX.h` selected by PlatformIO env
+  One tree flashes every node (avoids fork drift at node 2). NODE_ID, NODE_NUM, IN_AXIS_X/Y, and
+  the hot-pixel map (now `NODE_HOT_PIXELS`) moved out of main.c / tracker.h / background.c.
+  Design: `src/node_config.h` is a committed dispatcher (`#include NODE_CONFIG_FILE`); each node's
+  values live in a committed `src/node_config_XX.h`; `platformio.ini` has `[env:node01]` /
+  `[env:node02]` each defining `NODE_CONFIG_FILE` + its upload port. Flash = `pio run -e nodeXX -t
+  upload` — no file editing between nodes, all configs in git. Adding a node = new header + new
+  env. The single gitignored `secrets.h` now covers all nodes: `MQTT_USER` = NODE_ID, password
+  branches on NODE_NUM. GOTCHA: the native regression compiles the same cores, but the goldens
+  depend on node 01's axis/hot-pixels — `detector/native/node_config.h` is a separate COMMITTED
+  copy pinned to the fixture-capture values (Makefile `-I.` first; no NODE_CONFIG_FILE, so the
+  dispatcher never runs on host). Never sync the two; if reference values change, regenerate
+  goldens in the same change. No hot pixels on a node → `{-1}` sentinel (C rejects an empty
+  initializer). Env rename means fresh generated `sdkconfig.node01/02` from `sdkconfig.defaults`
+  (stale `sdkconfig.esp32dev` removed); `.pio` cache invalid after the dir rename — clean build
+  expected. Native regression rebuilt and passes 0/8/8/4. Also per-node: `NODE_WAKE_DIST_MIN_MM`,
+  `NODE_WAKE_DIST_CAP_MM`, `NODE_WAKE_BG_CLEARANCE_MM` (wake-window too-close / too-far + per-zone
+  bg clearance — mount geometry; node 2's mount is much higher than node 1's). Cap must sit
+  clearly under that mount's floor distance or floor noise storms the INT; on a higher mount a
+  person's deviation is larger, so clearance can rise for extra storm margin. main.c aliases all
+  three into the old WAKE_* names. Node 2 still needs: broker user (`mosquitto_passwd`), real
+  password in secrets.h, in_axis calibration at mount, hot-pixel map, wake window (MIN/CAP/
+  clearance) from measured floor distance. 2026-06-11
+
 ---
 
 ## Project Overview

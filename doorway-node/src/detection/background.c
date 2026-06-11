@@ -3,6 +3,7 @@
  * See background.h for the contract. Pure C, no ESP-IDF / FreeRTOS / I2C.
  */
 #include "background.h"
+#include "node_config.h" /* NODE_HOT_PIXELS -- per-sensor defect map */
 
 #include <stdlib.h>   /* qsort */
 #include <math.h>     /* fabsf */
@@ -11,7 +12,7 @@
 static const int VALID_STATUS[] = {5, 9, 10, 255};
 static const int N_VALID_STATUS = (int)(sizeof(VALID_STATUS) / sizeof(VALID_STATUS[0]));
 
-static const int HOT_PIXELS[] = {1, 5};  /* (0,1) bimodal flicker, (0,5) stuck hot */
+static const int HOT_PIXELS[] = NODE_HOT_PIXELS;
 static const int N_HOT_PIXELS = (int)(sizeof(HOT_PIXELS) / sizeof(HOT_PIXELS[0]));
 
 bool bg_trusted(const int status[BG_N_CELLS], int idx)

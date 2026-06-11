@@ -27,7 +27,7 @@ N_CELLS = GRID * GRID
 MIN_BLOB_CELLS = 4       # gate: track is "occupied" if largest blob >= this
 GRACE_FRAMES = 3         # bridge brief gate dropouts without splitting a track
 MAX_TRACK_FRAMES = 100   # force-close runaway tracks (also sets C buffer size)
-MIN_NET_DISPLACEMENT = 2   # cells; below this, track is loiter/jitter -> no event
+MIN_NET_DISPLACEMENT = 1.2   # cells; below this, track is loiter/jitter -> no event
 MIN_TRACK_FRAMES = 3     # reject ultra-short tracks (mostly redundant w/ gate+grace)
 ENDPOINT_AVG = 3         # average first/last N centroids for robust endpoints
 # ---------------------------------------------------------------------------

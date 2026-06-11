@@ -33,7 +33,8 @@ import pandas as pd  # noqa: E402
 from background import BackgroundModel, N_CELLS, BOOTSTRAP_FRAMES  # noqa: E402
 from tracker import Tracker, largest_blob  # noqa: E402
 
-# Must match the C tracker.h IN_AXIS_X / IN_AXIS_Y exactly.
+# Must match detector/native/node_config.h IN_AXIS_X / IN_AXIS_Y exactly
+# (the pinned host-regression copy, NOT any device's src/node_config.h).
 IN_AXIS = (-0.456, -0.890)
 
 

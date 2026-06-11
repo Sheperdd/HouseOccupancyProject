@@ -13,11 +13,14 @@
 # Windows note: GNU Make here is invoked as `mingw32-make`. gcc is MinGW-W64.
 
 CC      ?= gcc
-DET      = ../../doorway-node-01/src/detection
-CFLAGS   = -O2 -Wall -Wextra -std=c11 -I$(DET)
+DET      = ../../doorway-node/src/detection
+# -I. first: the cores include "node_config.h", and the host build must pick up
+# THIS directory's pinned copy (golden values), never the device's gitignored
+# src/node_config.h (which is not on the include path at all).
+CFLAGS   = -O2 -Wall -Wextra -std=c11 -I. -I$(DET)
 LDLIBS   = -lm
 SRCS     = $(DET)/background.c $(DET)/tracker.c test_replay.c
-HDRS     = $(DET)/background.h $(DET)/tracker.h
+HDRS     = $(DET)/background.h $(DET)/tracker.h node_config.h
 
 # Executable name: .exe on Windows, bare elsewhere.
 ifeq ($(OS),Windows_NT)

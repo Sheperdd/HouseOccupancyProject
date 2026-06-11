@@ -48,10 +48,9 @@
 // prefixed with this so you can filter logs by subsystem in the serial monitor.
 static const char *TAG = "vl53l5cx";
 
-// Per-node identity. Hardcoded for now; becomes MQTT-configurable in Phase 3.
-// Flows into the buffered event / MQTT payload so the backend can attribute a
-// crossing to a doorway.
-#define NODE_ID "doorway-node-01"
+// Per-node install constants (NODE_ID, in_axis, hot-pixel map) live in
+// node_config.h — gitignored; copy node_config.h.example and fill in per node.
+#include "node_config.h"
 
 // ----------------------------------------------------------------------------
 // Hardware wiring configuration
@@ -93,7 +92,7 @@ static const char *TAG = "vl53l5cx";
 #define CAPTURE_FREQ_HZ 10         // continuous ranging rate while capturing a crossing
 #define ARMED_FREQ_HZ 10           // autonomous ranging rate while waiting for motion
 #define ARMED_INTEGRATION_MS 10    // integration time in autonomous mode
-#define CAPTURE_IDLE_FRAMES 20     // re-arm after this many consecutive clear frames (~2s @10Hz)
+#define CAPTURE_IDLE_FRAMES 30     // re-arm after this many consecutive clear frames (~2s @10Hz)
 #define CAPTURE_MAX_FRAMES 300     // safety cap on one capture burst (~30s @10Hz)
 
 // ---- status/signal instrumentation (detection-review.md item E1) -----------
@@ -248,26 +247,22 @@ static uint8_t sensor_arm_autonomous(VL53L5CX_Configuration *Dev,
 // the distance checker, half keep motion. A person's blob spans 20+ cells at
 // peak (Phase 1), so either checker type sees them — the OR happens spatially.
 // Conveniently, hot pixels 1 and 5 land on the motion side of this parity.
-#define WAKE_DIST_MIN_MM 500     // below this = too close / noise
-#define WAKE_DIST_CAP_MM 1900    // absolute window ceiling
-#define WAKE_BG_CLEARANCE_MM 400 // return must be >= this much CLOSER than the
-                                 //   zone's calibrated background to count.
-                                 //   A fixed ceiling near the floor distance
-                                 //   (~2000mm) lets floor noise dip into the
-                                 //   window -> INT storm. Per-zone ceiling =
-                                 //   bg - clearance keeps the floor out by a
-                                 //   real margin; a person's head/shoulders
-                                 //   (600-900mm deviation, Phase 1) clears it
-                                 //   easily. 400 not 300: bimodal edge cells
-                                 //   (zone 13's doorframe flicker, ~320mm dev,
-                                 //   status 5) slipped a 300mm clearance.
-#define WAKE_ZONE_MAX_STRIKES 2  // a distance zone whose wakes yield this many
-                                 //   EMPTY bursts (no blob, no events) is a
-                                 //   bimodal/flicker cell the clearance math
-                                 //   can't see (rare second surface => median
-                                 //   bg and MAD both miss it). Demote it to a
-                                 //   motion checker until reboot/recalib —
-                                 //   self-healing per mount, no hand mask.
+// Window bounds (too close / too far) and the bg clearance are mount geometry
+// — set per node in node_config_XX.h. Mechanism: a fixed ceiling near the
+// floor distance lets floor noise dip into the window -> INT storm, so each
+// distance zone's ceiling is its calibrated background minus the clearance
+// ("return significantly closer than this zone's floor"), capped at
+// WAKE_DIST_CAP_MM.
+#define WAKE_DIST_MIN_MM NODE_WAKE_DIST_MIN_MM
+#define WAKE_DIST_CAP_MM NODE_WAKE_DIST_CAP_MM
+#define WAKE_BG_CLEARANCE_MM NODE_WAKE_BG_CLEARANCE_MM
+#define WAKE_ZONE_MAX_STRIKES 2 // a distance zone whose wakes yield this many
+                                //   EMPTY bursts (no blob, no events) is a
+                                //   bimodal/flicker cell the clearance math
+                                //   can't see (rare second surface => median
+                                //   bg and MAD both miss it). Demote it to a
+                                //   motion checker until reboot/recalib —
+                                //   self-healing per mount, no hand mask.
 
 // (Re)build the 64-checker array before each arm. Motion zones get the current
 // trip level (MQTT-configurable, review's set_motion_threshold role). Distance

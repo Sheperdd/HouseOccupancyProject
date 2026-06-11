@@ -29,11 +29,11 @@
 #define TRK_MIN_TRACK_FRAMES 3        /* reject ultra-short tracks */
 #define TRK_ENDPOINT_AVG 3            /* average first/last N centroids for robust endpoints */
 
-/* Per-node / per-mount install constant. Re-derived from the gate=4 source on
- * the walks fixture. MUST be recalibrated if the sensor is remounted; will
- * become MQTT-configurable in Phase 3. Keep in sync with gen_golden.py IN_AXIS. */
-#define IN_AXIS_X (-0.456f)
-#define IN_AXIS_Y (-0.890f)
+/* IN_AXIS_X/Y (per-node / per-mount install constant) lives in node_config.h:
+ * the gitignored src/node_config.h on the device build, the committed
+ * detector/native/node_config.h (pinned to the golden values) on the host
+ * regression build. Still pure C -- node_config.h is defines only. */
+#include "node_config.h"
 
 typedef enum
 {
