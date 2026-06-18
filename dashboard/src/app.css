@@ -1,0 +1,176 @@
+:root {
+  font-family: system-ui, -apple-system, sans-serif;
+  color: #1f2937;
+}
+
+body {
+  margin: 0;
+  background: #f8fafc;
+}
+
+.layout {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 12px 16px;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+header h1 {
+  font-size: 1.4rem;
+  margin: 8px 0;
+}
+
+.total {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.clamps {
+  color: #b45309;
+  font-weight: 400;
+}
+
+.banner {
+  background: #fee2e2;
+  border: 1px solid #dc2626;
+  color: #991b1b;
+  padding: 2px 10px;
+  border-radius: 6px;
+}
+
+/* node chips */
+.node-bar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0 12px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #fff;
+  border: 1px solid #d1d5db;
+}
+
+.chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9ca3af;
+}
+
+.chip-online .dot { background: #16a34a; }
+.chip-offline { color: #991b1b; }
+.chip-offline .dot { background: #dc2626; }
+
+/* main grid: plan + log side by side, stacked on phones */
+.content {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr);
+  gap: 16px;
+}
+
+@media (max-width: 800px) {
+  .content { grid-template-columns: 1fr; }
+}
+
+/* floor plan */
+.floor-tabs { margin-bottom: 6px; }
+
+.tab {
+  border: 1px solid #d1d5db;
+  background: #fff;
+  padding: 4px 14px;
+  cursor: pointer;
+}
+
+.tab.active {
+  background: #1f2937;
+  color: #fff;
+  border-color: #1f2937;
+}
+
+.zone-banner {
+  margin: 4px 0;
+  font-size: 0.9rem;
+  color: #374151;
+}
+
+.plan-svg {
+  width: 100%;
+  height: auto;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+}
+
+.room rect {
+  stroke: #475569;
+  stroke-width: 0.06;
+}
+
+.room.occ-0 rect { fill: #f1f5f9; }
+.room.occ-1 rect { fill: #bfdbfe; }
+.room.occ-many rect { fill: #60a5fa; }
+
+.room-name {
+  font-size: 0.42px;
+  text-anchor: middle;
+  fill: #334155;
+}
+
+.room-count {
+  font-size: 1.1px;
+  font-weight: 700;
+  text-anchor: middle;
+  fill: #1d4ed8;
+}
+
+.doorway circle {
+  stroke: #fff;
+  stroke-width: 0.06;
+}
+
+.dw-online circle { fill: #16a34a; }
+.dw-offline circle { fill: #dc2626; }
+.dw-unsensored circle {
+  fill: #cbd5e1;
+  stroke: #94a3b8;
+  stroke-dasharray: 0.08 0.08;
+}
+
+/* event log */
+.event-log h2 {
+  font-size: 1rem;
+  margin: 4px 0;
+}
+
+.event-log ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.85rem;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.event-log li {
+  padding: 3px 0;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.event-log li.dup { text-decoration: line-through; opacity: 0.6; }
+.event-log li.unmapped { color: #b91c1c; }
+
+.muted { color: #6b7280; }

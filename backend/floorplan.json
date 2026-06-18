@@ -1,0 +1,49 @@
+{
+  "_comment": "Real layout (2026-06-11, rev 2): open-concept main area (entrance+kitchen+living+stairs as one room), hallway going out left to bathroom + bedrooms 2/3. Only three doorways drawn: the two sensored nodes and the main-area/hallway opening. ZONES: counts live on zones — all main-floor rooms share zone 'main'; a room without 'zone' is its own zone.",
+  "floors": [
+    {
+      "id": "main",
+      "name": "Main Floor",
+      "rooms": [
+        { "id": "main-area", "name": "Main Area", "zone": "main", "x": 4, "y": 0, "w": 8, "h": 8 },
+        { "id": "hallway", "name": "Hallway", "zone": "main", "x": 0, "y": 3.5, "w": 4, "h": 1.5 },
+        { "id": "bedroom3", "name": "Bedroom 3", "zone": "main", "x": 0, "y": 0, "w": 2, "h": 3.5 },
+        { "id": "bedroom2", "name": "Bedroom 2", "zone": "main", "x": 2, "y": 0, "w": 2, "h": 3.5 },
+        { "id": "bathroom", "name": "Bathroom", "zone": "main", "x": 0, "y": 5, "w": 4, "h": 3 }
+      ]
+    },
+    {
+      "id": "basement",
+      "name": "Basement",
+      "rooms": [
+        { "id": "bedroom1", "name": "Bedroom 1", "x": 4, "y": 2, "w": 4, "h": 4 }
+      ]
+    }
+  ],
+  "doorways": [
+    {
+      "id": "front-door",
+      "rooms": ["outside", "main-area"],
+      "node_id": "doorway-node-02",
+      "in_room": "main-area",
+      "floor": "main",
+      "x": 6, "y": 8
+    },
+    {
+      "id": "bedroom1-door",
+      "rooms": ["main-area", "bedroom1"],
+      "node_id": "doorway-node-01",
+      "in_room": "bedroom1",
+      "floor": "basement",
+      "x": 6, "y": 2
+    },
+    {
+      "id": "hall-arch",
+      "rooms": ["main-area", "hallway"],
+      "node_id": null,
+      "in_room": "hallway",
+      "floor": "main",
+      "x": 4, "y": 4.25
+    }
+  ]
+}
